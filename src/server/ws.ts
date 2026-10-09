@@ -1,21 +1,18 @@
 /**
- * The Responses WebSocket mode (spec §2, the default transport): one connection carries
- * `response.create`, `response.steer` and `response.cancel` client events; the server sends
- * the stream events of each response (and of its successors in the same turn).
- * Closing the connection cancels a response it created that is not `background`.
+ * The Responses WebSocket mode (spec §2, the default transport): one connection carries the
+ * standard client events, `response.create` and `response.steer`; the server sends the stream
+ * events of each response (and of its successors in the same turn). Cancelling is the standard
+ * `POST /v1/responses/{id}/cancel`. Closing the connection cancels a response it created that is
+ * not `background`.
  */
 import type { IncomingMessage } from "node:http";
 import type { Duplex } from "node:stream";
 import { WebSocketServer, type WebSocket } from "ws";
-import type { CreateParams, ResponseSteerInput, ResponsesApi } from "../api/types.js";
+import type { AgentResponse, CreateParams, ResponseSteerFailedEvent, ResponseSteerInput, ResponsesApi } from "../api/types.js";
 import { TERMINAL_EVENTS } from "../api/types.js";
 import { ApiError } from "../api/errors.js";
 import type { BearerAuth } from "./auth.js";
 
-export interface WsOptions {
-  agent: ResponsesApi;
-  auth: BearerAuth;
-}
 
 export interface WebSocketHandler {
   handleUpgrade: (req: IncomingMessage, socket: Duplex, head: Buffer) => void;
@@ -23,8 +20,7 @@ export interface WebSocketHandler {
   close: () => void;
 }
 
-export function createWebSocketHandler(opts: WsOptions): WebSocketHandler {
-  const { agent, auth } = opts;
+export function createWebSocketHandler(agent: ResponsesApi, auth: BearerAuth): WebSocketHandler {
   const wss = new WebSocketServer({ noServer: true });
   wss.on("connection", (ws) => attach(ws));
 
@@ -53,12 +49,15 @@ export function createWebSocketHandler(opts: WsOptions): WebSocketHandler {
   function attach(ws: WebSocket): void {
     const created = new Set<string>();
     const unsubs = new Set<() => void>();
-    const send = (msg: unknown): void => {
+    /** The sequence number of the last event sent here (a steer failure follows it). */
+    let lastSequence = -1;
+    const send = (msg: object & { type: string; sequence_number?: number }): void => {
+      if (typeof msg.sequence_number === "number") lastSequence = msg.sequence_number;
       if (ws.readyState === ws.OPEN) ws.send(JSON.stringify(msg));
     };
-    const sendError = (err: unknown, extra: Record<string, unknown> = {}): void => {
+    const sendError = (err: unknown): void => {
       const e = ApiError.from(err);
-      send({ type: "error", ...extra, error: e.toBody().error });
+      send({ type: "error", status: e.status, error: e.toBody().error } as { type: string });
     };
 
     ws.on("message", (raw) => {
@@ -70,15 +69,9 @@ export function createWebSocketHandler(opts: WsOptions): WebSocketHandler {
         return;
       }
       const type = String(msg.type ?? "");
-      if (type === "response.create") {
-        onCreate(msg).catch((err) => sendError(err, { event_id: msg.event_id ?? null }));
-      } else if (type === "response.steer") {
-        onSteer(msg).catch((err) => sendError(err, { event_id: msg.event_id ?? null }));
-      } else if (type === "response.cancel") {
-        onCancel(msg).catch((err) => sendError(err, { event_id: msg.event_id ?? null }));
-      } else {
-        sendError(ApiError.invalid(`Unknown client event type '${type}'.`), { event_id: msg.event_id ?? null });
-      }
+      if (type === "response.create") onCreate(msg).catch(sendError);
+      else if (type === "response.steer") onSteer(msg).catch(sendError);
+      else sendError(ApiError.invalid(`Unknown client event type '${type}'.`, null, "type"));
     });
 
     ws.on("close", () => {
@@ -88,45 +81,36 @@ export function createWebSocketHandler(opts: WsOptions): WebSocketHandler {
     });
 
     async function onCreate(msg: Record<string, unknown>): Promise<void> {
-      const { type: _t, event_id: _e, ...params } = msg;
+      const { type: _t, ...params } = msg;
       const response = await agent.create({ ...params, stream: true } as CreateParams);
       created.add(response.id);
       const unsub = agent.stream(response.id, -1, (ev) => {
         send(ev);
-        if (TERMINAL_EVENTS.has(ev.type)) {
-          created.delete(response.id);
-          queueMicrotask(() => {
-            unsub();
-            unsubs.delete(unsub);
-          });
-        }
+        if (!TERMINAL_EVENTS.has(ev.type)) return;
+        if (ev.type === "response.incomplete" && (ev as { response: AgentResponse }).response.incomplete_details?.reason === "steered") return;
+        created.delete(response.id);
+        queueMicrotask(() => {
+          unsub();
+          unsubs.delete(unsub);
+        });
       });
       unsubs.add(unsub);
     }
 
     async function onSteer(msg: Record<string, unknown>): Promise<void> {
-      if (msg.input === undefined) throw ApiError.invalid("Missing required parameter: 'input'.", "missing_required_parameter", "input");
-      let previous = typeof msg.previous_response_id === "string" ? msg.previous_response_id : null;
-      if (!previous) {
-        const turn = agent.status().turn;
-        if (!turn) {
-          send({ type: "response.steer.failed", event_id: msg.event_id ?? null, error: { type: "invalid_request_error", code: "response_not_active", message: "No response is running; start a new turn." } });
-          return;
-        }
-        previous = turn.response_id;
-      }
-      const { liveResponseId, result, steerId } = await agent.steer(previous, msg.input as ResponseSteerInput);
-      if (!liveResponseId) {
-        send({ type: "response.steer.failed", event_id: msg.event_id ?? null, steer: { id: steerId, previous_response_id: previous }, error: { type: "invalid_request_error", code: "response_not_active", message: "The response ended before the input could be taken in; start a new turn." } });
-        return;
-      }
-      await result;
-    }
-
-    async function onCancel(msg: Record<string, unknown>): Promise<void> {
-      const id = typeof msg.response_id === "string" ? msg.response_id : null;
-      if (!id) throw ApiError.invalid("Missing required parameter: 'response_id'.", "missing_required_parameter", "response_id");
-      await agent.cancel(id);
+      const previous = typeof msg.previous_response_id === "string" ? msg.previous_response_id : "";
+      const outcome = previous
+        ? await agent.steer(previous, msg.input as ResponseSteerInput)
+        : { id: null, result: Promise.resolve({ code: "invalid_input", message: "Missing required parameter: 'previous_response_id'." }) };
+      const r = await outcome.result;
+      if (r === "taken_in") return;
+      const failed: ResponseSteerFailedEvent = {
+        type: "response.steer.failed",
+        sequence_number: lastSequence + 1,
+        steer: { ...(outcome.id ? { id: outcome.id } : {}), previous_response_id: previous, input: msg.input as ResponseSteerInput },
+        error: { type: "invalid_request_error", code: r.code, message: r.message },
+      };
+      send(failed);
     }
   }
 }

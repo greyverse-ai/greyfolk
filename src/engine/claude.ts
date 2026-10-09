@@ -1,106 +1,66 @@
 /**
- * Claude engine: the Claude Agent SDK (spec §1, §3, §4, §5).
+ * Claude engine: the Claude Agent SDK behind the Responses protocol.
  *
- * - One Claude Code process carries the session across turns (streaming input): each turn is one
- *   user message into it, so native subagents keep running between turns and Claude Code itself
- *   carries a late result into the session, as it does on its own (§5). The process is a child of greyfolk in its own process group (started through
- *   `--engine-exec` when given) and is restarted with `resume` if it dies.
- * - Everything loads from the agent folder: `cwd` = `CLAUDE_CONFIG_DIR` = agent folder, setting
- *   sources limited to the folder's own `settings.json`, auto-memory off, the soul as the whole
- *   system prompt, and no MCP server but the request's (`strictMcpConfig`).
- * - A turn's MCP servers reach the CLI over its control channel (`setMcpServers`), never argv, so
- *   per-turn credentials do not show in the process list.
- * - Before any MCP tool runs, a `PreToolUse` hook enforces the request's `allowed_tools` and
- *   `require_approval` (asking the caller), ahead of any allow rule in the folder's settings.
- * - Tool kinds turned off map to Claude Code's built-in tools (shell, files, web); with every
- *   kind off only the non-host built-ins remain, and the session's `init` tool list must hold
- *   nothing else (an allow-list; anything unknown fails the turn before a tool can run).
- * - Native subagents are Claude Code's own internal tool (`Agent`), which the model calls itself;
- *   greyfolk only reports their start and end (`task_started` / `task_notification`).
- * - Steer = a user message pushed mid-turn with its own uuid; it is taken in at the first frame
- *   Claude stamps with that uuid (`user_message_uuid`). A steer the CLI only reaches after the
- *   turn's result opens the successor response when its stamped reply starts.
+ * - One Claude Code process per conversation, kept across turns (the SDK's streaming input), so
+ *   the session, compaction, native subagents and their late results stay Claude Code's own.
+ *   The process runs in its own process group (through `--engine-exec` when given).
+ * - The agent folder is Claude Code's config home (`cwd` = `CLAUDE_CONFIG_DIR`): its own settings
+ *   files there are read as usual (setting source `user`); the soul is the system prompt.
+ * - The engine's own options (after `--`) go to Claude Code's command line as they are (SDK
+ *   `extraArgs`), e.g. `--tools Agent,TodoWrite`.
+ * - A turn's MCP servers go over the SDK's control channel (`setMcpServers`), never argv.
+ * - The request's `allowed_tools` and `require_approval` are applied in a `PreToolUse` hook (it
+ *   runs before Claude Code's own permission rules); an approval becomes the standard
+ *   `mcp_approval_request`.
+ * - Every user message greyfolk sends carries a uuid, and Claude Code stamps each step with the
+ *   uuids it answers: that is how a step is told to be the turn's (or a steer's) rather than one
+ *   Claude Code runs on its own between turns. A steer is taken in when a step carries its uuid.
  */
 import { randomUUID } from "node:crypto";
 import { promises as fs } from "node:fs";
-import * as path from "node:path";
 import type { ChildProcess } from "node:child_process";
-import { query, type HookCallback, type McpServerConfig, type Options, type Query, type SDKMessage, type SDKUserMessage, type SettingSource } from "@anthropic-ai/claude-agent-sdk";
-import type { HistoryMessage } from "../api/types.js";
-import type { QueuedSteer } from "../common/steer-queue.js";
-import { usage, type Turn, type TurnEnd } from "../common/turn.js";
-import { exists, isInside } from "../common/fsutil.js";
+import { getSessionMessages, query, type HookCallback, type McpServerConfig, type Options, type Query, type SDKMessage, type SDKUserMessage } from "@anthropic-ai/claude-agent-sdk";
+import type { InputMessage } from "../api/input.js";
 import type { McpAttachment } from "../mcp/translate.js";
-import { TOOL_KINDS, type ToolKind } from "../options.js";
-import type { Engine, EngineOptions, EngineState, EngineTurn } from "./engine.js";
+import { usage, type BuiltinCall, type Turn, type TurnEnd } from "../service/turn.js";
+import type { ConversationMessage, Engine, EngineOptions, EngineState, EngineTurn } from "./engine.js";
 import { checkExecPrefix, killGroup, spawnGroup } from "./process.js";
 import { foldInput, textOf } from "./prompt.js";
 import { registerEngine } from "./registry.js";
-import { mcpToolAllowed, type SubagentProfile } from "./subagent-profile.js";
 
-/** Pinned engine package; the tool lists below and resume-from-copy are checked per version (spec §3). */
-export const CLAUDE_SDK_VERSION = "0.3.292";
-
-/**
- * Setting sources Claude Code may read (spec §3): only `user`, which with `CLAUDE_CONFIG_DIR` = the
- * agent folder is that folder's own `settings.json`. `project`/`local` stay off.
- */
-export const CLAUDE_SETTING_SOURCES: SettingSource[] = ["user"];
-
-/** Claude Code's built-in tools per tool kind (kinds with none are simply nothing to turn off). */
-export const TOOLS_BY_KIND: Record<ToolKind, string[]> = {
-  shell: ["Bash", "BashOutput", "KillShell", "Monitor", "PowerShell"],
-  files: ["Read", "Write", "Edit", "MultiEdit", "NotebookEdit", "Glob", "Grep", "LS", "LSP"],
-  web: ["WebFetch", "WebSearch"],
-  browser: [],
-  images: [],
-  apps: [],
-};
-
-/** Built-in tools of every host kind. */
-export const HOST_TOOLS = Object.values(TOOLS_BY_KIND).flat();
-
-/** The only built-ins kept with every host kind off: native subagents and the todo list. */
-export const NON_HOST_TOOLS = ["Agent", "TodoWrite"];
-/** Built-ins that read the request's own MCP resources; allowed with every host kind off. */
-const MCP_RESOURCE_TOOLS = ["ListMcpResourcesTool", "ReadMcpResourceTool"];
-
-/** Built-in tools a profiled subagent gets when host tools are on (no shell: it could write anywhere). */
-export const PROFILE_HOST_TOOLS = ["Read", "Glob", "Grep", "Write", "Edit"];
-
-const WRITING_TOOLS = new Set(["Write", "Edit", "MultiEdit", "NotebookEdit"]);
-
-export function toolsOf(kinds: Iterable<ToolKind>): string[] {
-  return [...kinds].flatMap((k) => TOOLS_BY_KIND[k]);
+/** `--flag value` / `--flag=value` / `--flag` → the SDK's `extraArgs` (passed to Claude Code as they are). */
+export function toExtraArgs(args: string[]): Record<string, string | null> {
+  const out: Record<string, string | null> = {};
+  for (let i = 0; i < args.length; i++) {
+    const a = args[i]!;
+    if (!a.startsWith("--")) throw new Error(`claude engine option '${a}' must start with --`);
+    const eq = a.indexOf("=");
+    if (eq > 0) out[a.slice(2, eq)] = a.slice(eq + 1);
+    else if (args[i + 1] !== undefined && !args[i + 1]!.startsWith("--")) out[a.slice(2)] = args[++i]!;
+    else out[a.slice(2)] = null;
+  }
+  return out;
 }
 
 export interface ClaudeEngineOptions extends EngineOptions {
-  /** Injected `query` for tests; defaults to the SDK's. */
   queryFn?: typeof query;
-  /** Extra environment for the CLI process (never credentials from greyfolk itself). */
   env?: Record<string, string>;
 }
 
-/** Push-driven async iterable: the SDK's streaming prompt. */
 class InputQueue implements AsyncIterable<SDKUserMessage> {
   private readonly items: SDKUserMessage[] = [];
   private waiters: ((r: IteratorResult<SDKUserMessage>) => void)[] = [];
   private closed = false;
-
   push(msg: SDKUserMessage): void {
     if (this.closed) return;
     const w = this.waiters.shift();
     if (w) w({ value: msg, done: false });
     else this.items.push(msg);
   }
-
   close(): void {
-    if (this.closed) return;
     this.closed = true;
-    for (const w of this.waiters) w({ value: undefined, done: true });
-    this.waiters = [];
+    for (const w of this.waiters.splice(0)) w({ value: undefined, done: true });
   }
-
   [Symbol.asyncIterator](): AsyncIterator<SDKUserMessage> {
     return {
       next: () => {
@@ -113,39 +73,42 @@ class InputQueue implements AsyncIterable<SDKUserMessage> {
   }
 }
 
-/** The one Claude Code process. */
 export interface Proc {
   query: Query;
   input: InputQueue;
   abort: AbortController;
   child: ChildProcess | null;
-  /** The `init` tool list was checked. */
-  checked: boolean;
+  /** The session this process carries (null until Claude Code names it). */
+  session: string | null;
+  /** Background tasks (subagents and the like) still running in this process. */
+  tasks: number;
 }
 
-/** The turn being served. */
 interface Active {
   turn: Turn;
+  /** The process the turn runs on. */
+  proc: Proc;
+  /** The uuids of the user messages this turn sent (its input, then each steer). */
+  uuids: Set<string>;
+  /** The step Claude Code is running now answers this turn (its frames carry one of `uuids`). */
+  mine: boolean;
   mcp: Map<string, McpAttachment>;
   /** Steers pushed and not yet taken in: uuid → steer id. */
   steers: Map<string, string>;
   end: (e: TurnEnd) => void;
   cancelled: boolean;
   error: string | null;
-  /** The turn's message is in; frames before that belong to a step Claude Code ran on its own. */
-  sent: boolean;
+  /** Tool calls of the turn: shown as MCP or as Claude Code's own, or not shown (refused or awaiting approval). */
+  calls: Map<string, "mcp" | "builtin" | "skip">;
 }
 
-export function userMessage(text: string, uuid?: string): SDKUserMessage {
-  return { type: "user", message: { role: "user", content: text }, parent_tool_use_id: null, ...(uuid ? { uuid } : {}) } as SDKUserMessage;
+export function userMessage(text: string, uuid: string): SDKUserMessage {
+  return { type: "user", message: { role: "user", content: text }, parent_tool_use_id: null, uuid } as SDKUserMessage;
 }
 
 export function toMcpServers(mcp: McpAttachment[]): Record<string, McpServerConfig> {
   const out: Record<string, McpServerConfig> = {};
-  for (const m of mcp) {
-    if (m.kind === "http") out[m.label] = { type: "http", url: m.url, headers: m.headers };
-    else out[m.label] = { type: "stdio", command: m.command, args: m.args, env: m.env };
-  }
+  for (const m of mcp) out[m.label] = m.kind === "http" ? { type: "http", url: m.url, headers: m.headers } : { type: "stdio", command: m.command, args: m.args, env: m.env };
   return out;
 }
 
@@ -157,111 +120,95 @@ export function splitMcpToolName(name: string): { label: string; tool: string } 
   return i < 0 ? null : { label: rest.slice(0, i), tool: rest.slice(i + 2) };
 }
 
-/** Claude Code names a project folder by replacing every non-alphanumeric character of the cwd with '-'. */
-export function projectDirName(cwd: string): string {
-  return cwd.replace(/[^A-Za-z0-9]/g, "-");
-}
-
-/** Decides a subagent's tool call under the profile: null = fine, string = reason to deny. */
-export function profileDenial(p: SubagentProfile, toolName: string, input: unknown): string | null {
-  const mcp = splitMcpToolName(toolName);
-  if (mcp) return mcpToolAllowed(p, `${mcp.label}__${mcp.tool}`) ? null : `subagent profile '${p.name}': ${toolName} is not among its MCP tools`;
-  if (WRITING_TOOLS.has(toolName)) {
-    const file = (input as { file_path?: unknown; notebook_path?: unknown } | null)?.file_path ?? (input as { notebook_path?: unknown } | null)?.notebook_path;
-    if (typeof file !== "string") return `subagent profile '${p.name}': ${toolName} without a file path`;
-    if (!p.writable || !isInside(p.writable, file)) return `subagent profile '${p.name}': ${file} lies outside its writable folder`;
+/** Claude Code's own tool as the standard item that means the same (Turn.builtinStarted). */
+export function builtinCall(name: string, input: unknown): BuiltinCall {
+  const i = (input ?? {}) as Record<string, unknown>;
+  if ((name === "Bash" || name === "PowerShell") && typeof i.command === "string") return { kind: "shell", command: i.command };
+  const file = i.file_path ?? i.notebook_path;
+  if (["Write", "Edit", "MultiEdit", "NotebookEdit"].includes(name) && typeof file === "string") {
+    return { kind: "apply_patch", path: file, diff: patchOf(name, i), operation: name === "Write" ? "create_file" : "update_file" };
   }
-  return null;
+  if (name === "WebSearch" && typeof i.query === "string") return { kind: "web_search", query: i.query };
+  return { kind: "custom", name, input };
 }
 
-/** The uuids of user messages a frame answers (Claude stamps replies with them). */
-function stampsOf(msg: SDKMessage): string[] {
+const lines = (text: unknown, sign: "+" | "-"): string[] => (typeof text === "string" && text !== "" ? text.split("\n").map((l) => sign + l) : []);
+
+/** The change a file tool makes, as the standard's diff (`+`/`-` lines; a hunk per edit). */
+export function patchOf(name: string, i: Record<string, unknown>): string {
+  if (name === "Write") return lines(i.content, "+").join("\n");
+  if (name === "NotebookEdit") return ["@@", ...lines(i.new_source, "+")].join("\n");
+  const edits = name === "MultiEdit" && Array.isArray(i.edits) ? (i.edits as Record<string, unknown>[]) : [i];
+  return edits.flatMap((e) => ["@@", ...lines(e.old_string, "-"), ...lines(e.new_string, "+")]).join("\n");
+}
+
+const stampsOf = (msg: SDKMessage): string[] => {
   const m = msg as { user_message_uuid?: string; user_message_uuids?: string[] };
-  return [...(m.user_message_uuid ? [m.user_message_uuid] : []), ...(m.user_message_uuids ?? [])];
-}
-
-const denyHook = (reason: string) => ({ continue: true, hookSpecificOutput: { hookEventName: "PreToolUse" as const, permissionDecision: "deny" as const, permissionDecisionReason: reason } });
-const allowHook = () => ({ continue: true, hookSpecificOutput: { hookEventName: "PreToolUse" as const, permissionDecision: "allow" as const } });
+  return m.user_message_uuids ?? (m.user_message_uuid ? [m.user_message_uuid] : []);
+};
+const hook = (decision: "allow" | "deny", reason?: string) => ({ continue: true, hookSpecificOutput: { hookEventName: "PreToolUse" as const, permissionDecision: decision, ...(reason ? { permissionDecisionReason: reason } : {}) } });
+const admits = (server: McpAttachment, tool: string): boolean => !server.allowedTools || server.allowedTools.includes(tool);
 
 export class ClaudeEngine implements Engine {
   readonly name = "claude";
-  /** Anthropic model names; `--model request` may choose within this family only. */
   readonly modelFamily = /^claude-/i;
   readonly canAskApproval = true;
-  private readonly opts: ClaudeEngineOptions;
+  readonly canSteer = true;
   private readonly queryFn: typeof query;
-  private readonly offTools: string[];
-  private readonly noHostTools: boolean;
-  private sid: string | null = null;
+  private readonly extraArgs: Record<string, string | null>;
   private model: string | null = null;
   private proc: Proc | null = null;
   private active: Active | null = null;
-  /** Native subagents still running (the agent stays busy while any run). */
-  private readonly subagents = new Set<string>();
-  /**
-   * Claude Code is running a step of its own between greyfolk's turns (it carries a late subagent
-   * result into the session that way); the next turn's message waits until that step ends.
-   */
-  private ownStep = false;
-  private ownStepDone: (() => void)[] = [];
-  private readonly lost: string[] = [];
-  /** The model the last turn's request chose, if any. */
   private requestedModel: string | null = null;
+  /** Steers of a cancelled turn that Claude Code still had queued: interrupted as soon as they start. */
+  private readonly stopWhenStarted = new Set<string>();
 
-  constructor(opts: ClaudeEngineOptions) {
-    this.opts = opts;
+  constructor(private readonly opts: ClaudeEngineOptions) {
     this.queryFn = opts.queryFn ?? query;
-    this.offTools = toolsOf(opts.disabledTools);
-    this.noHostTools = TOOL_KINDS.every((k) => opts.disabledTools.has(k));
+    this.extraArgs = toExtraArgs(opts.engineArgs);
   }
 
-  async start(sessionId: string | null): Promise<void> {
+  async start(): Promise<void> {
     const st = await fs.stat(this.opts.agentDir).catch(() => null);
     if (!st?.isDirectory()) throw new Error(`agent folder not found: ${this.opts.agentDir}`);
-    if (!this.opts.soul.trim()) throw new Error("the soul (agent instruction file) is empty; refusing to start an engine without one");
+    if (!this.opts.soul.trim()) throw new Error("the soul (agent instruction file) is empty");
     checkExecPrefix(this.opts.exec);
-    await fs.mkdir(path.join(this.opts.agentDir, "projects"), { recursive: true });
-    this.sid = sessionId;
+    // The SDK's session readers find this agent's sessions through the same config home.
+    process.env.CLAUDE_CONFIG_DIR = this.opts.agentDir;
   }
 
-  /** The hook that runs before every tool call, ahead of Claude Code's own permission rules. */
+  /**
+   * Runs before every tool call, ahead of Claude Code's own permission rules. An MCP tool runs
+   * only in a step that answers the turn whose request named its server; an approval becomes the
+   * standard `mcp_approval_request`, and the call shows once it is allowed.
+   */
   readonly preToolUse: HookCallback = async (input) => {
     if (input.hook_event_name !== "PreToolUse") return { continue: true };
-    const profile = this.opts.subagentProfile;
-    if (profile && input.agent_id) {
-      const reason = profileDenial(profile, input.tool_name, input.tool_input);
-      if (reason) return denyHook(reason);
-    }
     const mcp = splitMcpToolName(input.tool_name);
     if (!mcp) return { continue: true };
-    const active = this.active;
-    const server = active?.mcp.get(mcp.label);
-    if (!active || !server) return denyHook(`MCP server '${mcp.label}' is not attached to this turn`);
-    if (server.allowedTools && !server.allowedTools.includes(mcp.tool)) return denyHook(`${mcp.tool} is not among the allowed tools of '${mcp.label}'`);
-    if (server.requireApproval === "never") return allowHook();
-    const decision = await active.turn.askPermission({ tool: input.tool_name, operation: input.tool_input });
-    return decision === "allow" ? allowHook() : denyHook("Denied through greyfolk.");
+    const a = this.active;
+    const server = a?.mcp.get(mcp.label);
+    if (!a || !a.mine || a.cancelled) return hook("deny", "No turn asked for this step.");
+    if (!server) return hook("deny", `MCP server '${mcp.label}' is not attached to this turn`);
+    if (!admits(server, mcp.tool)) return hook("deny", `${mcp.tool} is not among the allowed tools of '${mcp.label}'`);
+    if (server.requireApproval === "never") return hook("allow");
+    a.calls.set(input.tool_use_id, "skip");
+    const ok = await a.turn.requestApproval({ server: mcp.label, name: mcp.tool, arguments: input.tool_input });
+    if (!ok || this.active !== a || a.cancelled) return hook("deny", "Not approved.");
+    a.turn.mcpCallStarted(input.tool_use_id, { server: mcp.label, name: mcp.tool, arguments: input.tool_input });
+    a.calls.set(input.tool_use_id, "mcp");
+    return hook("allow");
   };
 
-  /** The SDK options the process starts with (public so tests can check the isolation settings). */
-  buildOptions(proc: Pick<Proc, "abort" | "child">): Options {
-    const env: Record<string, string | undefined> = { ...process.env, ...this.opts.env, CLAUDE_CONFIG_DIR: this.opts.agentDir, DISABLE_AUTOUPDATER: "1" };
-    const profile = this.opts.subagentProfile;
+  buildOptions(proc: Pick<Proc, "abort" | "child">, resume: string | null): Options {
     const options: Options = {
       cwd: this.opts.agentDir,
-      env,
+      env: { ...process.env, ...this.opts.env, CLAUDE_CONFIG_DIR: this.opts.agentDir, DISABLE_AUTOUPDATER: "1" },
       abortController: proc.abort,
       systemPrompt: this.opts.soul,
-      settingSources: CLAUDE_SETTING_SOURCES,
-      strictMcpConfig: true,
-      managedSettings: { autoMemoryEnabled: false },
+      settingSources: ["user"],
+      extraArgs: this.extraArgs,
       permissionMode: "default",
-      canUseTool: async (toolName, input, { signal }) => {
-        if (NON_HOST_TOOLS.includes(toolName) || splitMcpToolName(toolName)) return { behavior: "allow", updatedInput: input };
-        const active = this.active;
-        const decision = active ? await active.turn.askPermission({ tool: toolName, operation: input, signal }) : "deny";
-        return decision === "allow" ? { behavior: "allow", updatedInput: input } : { behavior: "deny", message: "Denied through greyfolk." };
-      },
       includePartialMessages: true,
       persistSession: true,
       hooks: { PreToolUse: [{ hooks: [this.preToolUse] }] },
@@ -291,46 +238,33 @@ export class ClaudeEngine implements Engine {
         };
       },
     };
-    if (this.noHostTools) options.tools = NON_HOST_TOOLS;
-    if (this.offTools.length) options.disallowedTools = this.offTools;
-    if (profile) {
-      options.agents = {
-        [profile.name]: {
-          description: profile.description,
-          prompt: `${profile.description}\n\nYou work under a restricted profile. Report your result to the agent that spawned you.`,
-          tools: [...(this.noHostTools ? [] : PROFILE_HOST_TOOLS.filter((t) => !this.offTools.includes(t))), "mcp__*"],
-        },
-      };
-    }
-    if (this.sid) options.resume = this.sid;
+    if (resume) options.resume = resume;
     return options;
   }
 
-  private ensureProc(): Proc {
-    if (this.proc) return this.proc;
-    const proc: Proc = { abort: new AbortController(), child: null, input: new InputQueue(), query: null as unknown as Query, checked: false };
-    proc.query = this.queryFn({ prompt: proc.input, options: this.buildOptions(proc) });
+  /** The process for `conversation` (a new conversation when null): reused, or started with `resume`. */
+  private procFor(conversation: string | null): Proc {
+    const p = this.proc;
+    if (p && conversation !== null && p.session === conversation) return p;
+    if (p) this.kill(p);
+    const proc: Proc = { abort: new AbortController(), child: null, input: new InputQueue(), query: null as unknown as Query, session: conversation, tasks: 0 };
+    proc.query = this.queryFn({ prompt: proc.input, options: this.buildOptions(proc, conversation) });
     this.proc = proc;
     void this.pump(proc);
     return proc;
   }
 
-  /** Reads the process's messages for its whole life and routes them to the active turn. */
   private async pump(proc: Proc): Promise<void> {
     let error: string | null = null;
     try {
-      for await (const msg of proc.query) await this.route(msg, proc);
+      for await (const msg of proc.query) this.route(msg, proc);
     } catch (err) {
       error = err instanceof Error ? err.message : String(err);
     }
-    // The process is gone: anything still running in it is lost.
     if (this.proc === proc) this.proc = null;
-    this.ownStep = false;
-    for (const done of this.ownStepDone.splice(0)) done();
-    for (const id of this.subagents) this.lost.push(id);
-    this.subagents.clear();
+    // Only the turn running on this process ends with it (a newer process carries its own).
     const a = this.active;
-    if (a) this.finish(a, { status: a.cancelled ? "cancelled" : "failed", error: a.error ?? error ?? "Claude Code ended without a result.", usage: null });
+    if (a && a.proc === proc) this.finish(a, { status: a.cancelled ? "cancelled" : "failed", error: a.error ?? error ?? "Claude Code ended without a result.", usage: null });
   }
 
   private finish(a: Active, end: TurnEnd): void {
@@ -339,154 +273,152 @@ export class ClaudeEngine implements Engine {
     a.end(end);
   }
 
-  /** Fails the turn and stops the process: used when the process breaks a rule greyfolk relies on. */
-  private refuse(proc: Proc, reason: string): void {
-    if (this.active) this.active.error = reason;
-    this.kill(proc);
-  }
-
-  private async route(msg: SDKMessage, proc: Proc): Promise<void> {
+  private route(msg: SDKMessage, proc: Proc): void {
+    if (msg.type === "system") {
+      if (msg.subtype === "init") {
+        proc.session = msg.session_id;
+        if (this.active?.proc === proc) this.active.turn.conversationStarted(msg.session_id);
+        if (msg.model) this.model = msg.model;
+      } else if (msg.subtype === "background_tasks_changed") {
+        proc.tasks = msg.tasks.filter((t) => !t.ambient).length;
+      }
+      return;
+    }
+    // Which step a frame belongs to: the stamps of the user messages it answers.
+    const stamps = msg.type === "result" || !("parent_tool_use_id" in msg) || !msg.parent_tool_use_id ? stampsOf(msg) : [];
+    if (msg.type !== "result") {
+      for (const u of stamps) {
+        if (!this.stopWhenStarted.delete(u)) continue;
+        void proc.query.interrupt().catch(() => {});
+      }
+    }
     const a = this.active;
-    if (msg.type === "system" && msg.subtype === "init") {
-      if (!proc.checked) {
-        const allowed = new Set([...NON_HOST_TOOLS, ...MCP_RESOURCE_TOOLS]);
-        const on = msg.tools.filter((t) => !t.startsWith("mcp__") && (this.offTools.includes(t) || (this.noHostTools && !allowed.has(t))));
-        if (on.length) return this.refuse(proc, `tools that were turned off are on (${on.join(", ")}); refusing the turn`);
-        proc.checked = true;
-      }
-      if (msg.session_id && msg.session_id !== this.sid) {
-        this.sid = msg.session_id;
-        if (a) await a.turn.sessionStarted(this.sid);
-      }
-      if (msg.model) this.model = msg.model;
-      return;
+    if (!a || a.proc !== proc) return;
+    if (msg.type === "result") return this.stepEnded(a, msg, stamps);
+    if (stamps.length > 0) {
+      a.mine = stamps.some((u) => a.uuids.has(u));
+      if (a.mine) for (const u of stamps) this.takenIn(a, u);
     }
-    if (msg.type === "system" && msg.subtype === "task_started") {
-      // Only native subagents count (not background shell or monitor tasks).
-      if (msg.subagent_type) this.subagents.add(msg.task_id);
-      return;
-    }
-    if (msg.type === "system" && msg.subtype === "task_notification") {
-      this.subagents.delete(msg.task_id);
-      return;
-    }
-    if (!a || !a.sent) {
-      if (msg.type === "stream_event" || msg.type === "assistant" || msg.type === "user") this.ownStep = true;
-      if (msg.type === "result") {
-        this.ownStep = false;
-        for (const done of this.ownStepDone.splice(0)) done();
-      }
-      return;
-    }
-    if ((msg.type === "stream_event" || msg.type === "assistant") && !msg.parent_tool_use_id) {
-      for (const uuid of stampsOf(msg)) {
-        const steerId = a.steers.get(uuid);
-        if (!steerId) continue;
-        a.steers.delete(uuid);
-        a.turn.steerTakenIn(steerId);
-      }
-    }
+    if (!a.mine) return;
     switch (msg.type) {
-      case "stream_event": {
-        if (msg.parent_tool_use_id) return;
-        const ev = msg.event;
-        if (ev.type === "content_block_delta" && ev.delta.type === "text_delta") a.turn.textDelta(ev.delta.text);
+      case "stream_event":
+        if (!msg.parent_tool_use_id && msg.event.type === "content_block_delta" && msg.event.delta.type === "text_delta") a.turn.textDelta(msg.event.delta.text);
         return;
-      }
-      case "assistant": {
+      case "assistant":
         if (msg.parent_tool_use_id) return;
         for (const block of msg.message.content) {
           if (block.type === "text") a.turn.textDone(block.text);
-          else if (block.type === "thinking") a.turn.reasoning(block.thinking);
-          else if (block.type === "tool_use") {
-            const mcp = splitMcpToolName(block.name);
-            a.turn.mcpCallStarted(block.id, { server: mcp?.label ?? null, name: mcp?.tool ?? block.name, arguments: block.input });
-          }
+          else if (block.type === "thinking") a.turn.reasoning(block.thinking, "text");
+          else if (block.type === "tool_use") this.toolUse(a, block.id, block.name, block.input);
         }
         return;
-      }
       case "user": {
-        if (msg.parent_tool_use_id) return;
-        const content = msg.message.content;
-        if (!Array.isArray(content)) return;
-        for (const block of content) {
-          if (block.type === "tool_result") {
-            const out = typeof block.content === "string" ? block.content : (block.content ?? []).map((c) => (c.type === "text" ? c.text : `[${c.type}]`)).join("\n");
-            a.turn.mcpCallEnded(block.tool_use_id, out, block.is_error ? out : null);
-          }
+        if (msg.parent_tool_use_id || !Array.isArray(msg.message.content)) return;
+        for (const block of msg.message.content) {
+          if (block.type !== "tool_result") continue;
+          const out = typeof block.content === "string" ? block.content : (block.content ?? []).map((c) => (c.type === "text" ? c.text : `[${c.type}]`)).join("\n");
+          const kind = a.calls.get(block.tool_use_id);
+          a.calls.delete(block.tool_use_id);
+          if (kind === "mcp") a.turn.mcpCallEnded(block.tool_use_id, out, block.is_error ? out : null);
+          else if (kind === "builtin") a.turn.builtinEnded(block.tool_use_id, { output: out, failed: !!block.is_error, exitCode: block.is_error ? Number(/^Exit code (\d+)/m.exec(out)?.[1] ?? 1) : 0 });
         }
         return;
-      }
-      case "result": {
-        // A steer the CLI has not reached yet runs right after this result as its own step;
-        // the turn goes on until that step (stamped with the steer's uuid) has answered it.
-        if (a.steers.size > 0 && !a.cancelled) return;
-        const u = msg.usage ? usage(msg.usage.input_tokens, msg.usage.output_tokens) : null;
-        if (a.cancelled) return this.finish(a, { status: "cancelled", error: null, usage: u });
-        if (msg.subtype === "success" && !msg.is_error) return this.finish(a, { status: "completed", error: null, usage: u });
-        return this.finish(a, { status: "failed", error: msg.subtype === "success" ? msg.result : `Claude Code ended the turn: ${msg.subtype}`, usage: u });
       }
       default:
         return;
     }
   }
 
+  private toolUse(a: Active, id: string, name: string, input: unknown): void {
+    const mcp = splitMcpToolName(name);
+    if (!mcp) {
+      a.turn.builtinStarted(id, builtinCall(name, input));
+      a.calls.set(id, "builtin");
+      return;
+    }
+    const server = a.mcp.get(mcp.label);
+    // A call the hook refuses never runs; one that needs approval shows once it is allowed (the hook starts it).
+    if (!server || !admits(server, mcp.tool) || server.requireApproval === "always") {
+      if (!a.calls.has(id)) a.calls.set(id, "skip");
+      return;
+    }
+    a.turn.mcpCallStarted(id, { server: mcp.label, name: mcp.tool, arguments: input });
+    a.calls.set(id, "mcp");
+  }
+
+  private takenIn(a: Active, uuid: string): void {
+    const steerId = a.steers.get(uuid);
+    if (!steerId) return;
+    a.steers.delete(uuid);
+    a.turn.steerTakenIn(steerId);
+  }
+
+  private stepEnded(a: Active, msg: Extract<SDKMessage, { type: "result" }>, stamps: string[]): void {
+    const mine = stamps.length > 0 ? stamps.some((u) => a.uuids.has(u)) : a.mine;
+    a.mine = false;
+    if (!mine) return; // a step Claude Code ran on its own (e.g. a late subagent result)
+    const u = msg.usage ? usage(msg.usage.input_tokens, msg.usage.output_tokens) : null;
+    if (a.cancelled) return this.finish(a, { status: "cancelled", error: null, usage: u });
+    for (const s of stamps) this.takenIn(a, s);
+    // A steer still queued runs as the next step; the turn goes on until it is answered.
+    if (a.steers.size > 0) return;
+    if (msg.subtype === "success" && !msg.is_error) return this.finish(a, { status: "completed", error: null, usage: u });
+    return this.finish(a, { status: "failed", error: msg.subtype === "success" ? msg.result : `Claude Code ended the turn: ${msg.subtype}`, usage: u });
+  }
+
   async run(turn: Turn, req: EngineTurn): Promise<TurnEnd> {
     if (this.active) throw new Error("claude engine: a turn is already running");
     if (turn.cancelRequested) return { status: "cancelled", error: null, usage: null };
-    const proc = this.ensureProc();
+    const proc = this.procFor(req.conversation);
+    const uuid = randomUUID();
     let active!: Active;
     const ended = new Promise<TurnEnd>((resolve) => {
-      active = { turn, mcp: new Map(req.mcp.map((m) => [m.label, m])), steers: new Map(), end: resolve, cancelled: false, error: null, sent: false };
+      active = { turn, proc, uuids: new Set([uuid]), mine: false, mcp: new Map(req.mcp.map((m) => [m.label, m])), steers: new Map(), end: resolve, cancelled: false, error: null, calls: new Map() };
     });
     this.active = active;
+    if (proc.session) turn.conversationStarted(proc.session);
     try {
-      // The turn's MCP servers go over the control channel, never argv.
       await proc.query.setMcpServers(toMcpServers(req.mcp));
-      // A request's model applies to its turn only (--model request); go back to the agent's own after it.
       if (req.model || this.requestedModel) await proc.query.setModel(req.model ?? undefined);
       this.requestedModel = req.model;
     } catch (err) {
       this.finish(active, { status: "failed", error: `could not prepare the turn: ${err instanceof Error ? err.message : String(err)}`, usage: null });
       return ended;
     }
-    if (this.ownStep) await new Promise<void>((r) => this.ownStepDone.push(r));
-    if (turn.cancelRequested || active.cancelled) this.finish(active, { status: "cancelled", error: null, usage: null });
-    else {
-      active.sent = true;
-      proc.input.push(userMessage(foldInput(req.input, req.instructions), randomUUID()));
+    if (turn.cancelRequested || active.cancelled) {
+      this.finish(active, { status: "cancelled", error: null, usage: null });
+      return ended;
     }
+    // Claude Code queues it behind any step of its own that is still running.
+    proc.input.push(userMessage(foldInput(req.input, req.instructions), uuid));
     return ended;
   }
 
-  async steer(turn: Turn, steer: QueuedSteer): Promise<boolean> {
+  async steer(turn: Turn, id: string, input: InputMessage[]): Promise<boolean> {
     const a = this.active;
-    const proc = this.proc;
-    if (!a || a.turn !== turn || a.cancelled || !proc) return false;
+    if (!a || a.turn !== turn || a.cancelled || this.proc !== a.proc) return false;
     const uuid = randomUUID();
-    a.steers.set(uuid, steer.id);
-    proc.input.push(userMessage(foldInput(steer.input, null), uuid));
+    a.uuids.add(uuid);
+    a.steers.set(uuid, id);
+    a.proc.input.push(userMessage(foldInput(input, null), uuid));
     return true;
   }
 
   async cancel(): Promise<void> {
     const a = this.active;
-    const proc = this.proc;
-    if (!a || !proc) return;
+    if (!a) return;
     a.cancelled = true;
-    if (!a.sent) {
-      // run() sees the flag before sending anything; stop it waiting for Claude Code's own step.
-      for (const done of this.ownStepDone.splice(0)) done();
+    const proc = a.proc;
+    const receipt = await Promise.race([proc.query.interrupt().then((r) => r ?? null, () => undefined), new Promise<undefined>((r) => setTimeout(() => r(undefined), 5000).unref())]);
+    if (receipt === undefined) {
+      if (this.active === a) this.kill(proc);
       return;
     }
-    // Steers already pushed would run as a turn of their own after an interrupt: only stopping the process stops them.
-    if (a.steers.size > 0) return this.kill(proc);
-    const interrupted = proc.query.interrupt().then(
-      () => true,
-      () => false,
-    );
-    const ok = await Promise.race([interrupted, new Promise<boolean>((r) => setTimeout(() => r(false), 5000).unref())]);
-    if (!ok && this.active === a) this.kill(proc);
+    // Steers Claude Code still holds would run on their own after the interrupt: each is stopped as it starts.
+    const queued = receipt ? receipt.still_queued : [...a.steers.keys()];
+    for (const u of queued) if (a.steers.has(u)) this.stopWhenStarted.add(u);
+    // An interrupt before the turn's step started leaves no result to end it.
+    if (!a.mine && this.active === a) this.finish(a, { status: "cancelled", error: null, usage: null });
   }
 
   private kill(proc: Proc): void {
@@ -497,57 +429,16 @@ export class ClaudeEngine implements Engine {
   }
 
   state(): EngineState {
-    return {
-      running: this.active !== null,
-      sessionId: this.sid,
-      model: this.model,
-      subagents: { running: this.subagents.size, lost: [...this.lost] },
-      subagentProfileApplied: this.opts.subagentProfile !== null,
-    };
+    return { running: this.active !== null, conversation: this.proc?.session ?? null, model: this.model, subagents: this.proc?.tasks ?? 0 };
   }
 
-  /** The session JSONL Claude Code writes under `<config>/projects/<cwd>/<session id>.jsonl`. */
-  async sessionFile(): Promise<string | null> {
-    if (!this.sid) return null;
-    const projects = path.join(this.opts.agentDir, "projects");
-    const direct = path.join(projects, projectDirName(this.opts.agentDir), `${this.sid}.jsonl`);
-    if (await exists(direct)) return direct;
-    for (const d of await fs.readdir(projects).catch(() => [] as string[])) {
-      const p = path.join(projects, d, `${this.sid}.jsonl`);
-      if (await exists(p)) return p;
-    }
-    return null;
-  }
-
-  async history(): Promise<HistoryMessage[]> {
-    const file = await this.sessionFile();
-    if (!file) return [];
-    const raw = await fs.readFile(file, "utf8").catch(() => "");
-    const out: HistoryMessage[] = [];
-    for (const line of raw.split("\n")) {
-      if (!line.trim()) continue;
-      let rec: Record<string, unknown>;
-      try {
-        rec = JSON.parse(line) as Record<string, unknown>;
-      } catch {
-        continue;
-      }
-      if ((rec.type !== "user" && rec.type !== "assistant") || rec.isMeta === true) continue;
-      const message = rec.message as { content?: unknown } | undefined;
-      const text = message ? textOf(message.content) : "";
-      if (!text) continue;
-      out.push({ role: rec.type === "user" ? "user" : "assistant", text, at: typeof rec.timestamp === "string" ? rec.timestamp : null });
-    }
-    return out;
-  }
-
-  exportExcludes(): string[] {
-    // Login material never travels with a copy; the rest the CLI rebuilds.
-    return [".credentials.json", ".claude.json", ".claude.json.backup*", "statsig", "shell-snapshots", "debug", "cache", "telemetry", "todos", "plugins/cache", "file-history", ".update.lock"];
-  }
-
-  sessionPaths(): string[] {
-    return ["projects", "todos", "shell-snapshots", "file-history", "history.jsonl", "memory"];
+  async conversation(id: string): Promise<ConversationMessage[] | null> {
+    const messages = await getSessionMessages(id, { dir: this.opts.agentDir }).catch(() => []);
+    if (messages.length === 0) return null;
+    return messages
+      .filter((m) => (m.type === "user" || m.type === "assistant") && !m.parent_tool_use_id)
+      .map((m) => ({ role: m.type as "user" | "assistant", text: textOf((m.message as { content?: unknown } | null)?.content) }))
+      .filter((m) => m.text);
   }
 
   async stop(): Promise<void> {

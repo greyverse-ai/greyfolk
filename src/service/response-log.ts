@@ -134,17 +134,4 @@ export class ResponseLog {
       unsub();
     };
   }
-
-  /** Records a response that was running when a previous instance died. */
-  registerFailed(id: string, message: string): void {
-    if (this.records.has(id)) return;
-    const response = newResponse({ instructions: null, model: "", tools: [], metadata: {}, background: false, previous_response_id: null });
-    response.id = id;
-    response.status = "failed";
-    response.completed_at = response.created_at;
-    response.error = { code: "instance_stopped", message };
-    const rec = new ResponseRecord(response, id);
-    rec.emit({ type: "response.failed", response: rec.snapshot() });
-    this.records.set(id, rec);
-  }
 }

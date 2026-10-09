@@ -1,108 +1,68 @@
 /**
- * A scripted engine for tests and local dry runs. No model.
- *
- * Echoes each input message word by word ("echo: <text>") with a small delay, so steer and
- * cancel can land between model steps. Markers inside the text drive extras:
- *   [perm]  — asks a permission request (tool "Bash") before echoing and reports the decision
- *   [tool]  — one MCP call + result after echoing
- *   [fail]  — ends the turn failed
- *   [spawn] — starts a subagent that finishes `subagentDelayMs` after the turn ended (the agent
- *             stays busy until then)
- * The session is a JSONL transcript under `<agentDir>/fake-session/<id>.jsonl`.
+ * A scripted engine for tests and dry runs. No model, no SDK. Echoes each input message word by
+ * word ("echo: <text>") so steer and cancel can land between steps. Markers in the text:
+ *   [tool]    one MCP call (server "fake") and its result
+ *   [approve] asks approval before an MCP call to server "ext", then reports the answer
+ *   [fail]    ends the turn failed
+ *   [spawn]   a native subagent that runs `subagentDelayMs` past the turn (the agent stays busy)
  */
 import { randomBytes } from "node:crypto";
-import { promises as fs } from "node:fs";
-import * as path from "node:path";
-import type { HistoryMessage } from "../api/types.js";
 import type { InputMessage } from "../api/input.js";
-import type { QueuedSteer } from "../common/steer-queue.js";
-import { usage, type Turn, type TurnEnd } from "../common/turn.js";
-import type { Engine, EngineOptions, EngineState, EngineTurn } from "./engine.js";
+import { usage, type Turn, type TurnEnd } from "../service/turn.js";
+import type { ConversationMessage, Engine, EngineState, EngineTurn } from "./engine.js";
 import { registerEngine } from "./registry.js";
 
 export interface FakeEngineOptions {
-  agentDir: string;
   midTurnInput?: boolean;
-  /** Delay between words (ms). */
   wordDelayMs?: number;
-  /** How long after its turn ends a `[spawn]` subagent reports (ms). */
   subagentDelayMs?: number;
-  model?: string | null;
 }
 
-const SESSION_DIR = "fake-session";
-
-function sleep(ms: number): Promise<void> {
-  return new Promise((r) => setTimeout(r, ms));
-}
+const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
 
 export class FakeEngine implements Engine {
   readonly name = "fake";
-  /** The fake accepts `fake-*` model names only (so family rejection is testable). */
   readonly modelFamily = /^fake-/;
   readonly canAskApproval = true;
-  private readonly agentDir: string;
-  private readonly midTurnInput: boolean;
-  private sid: string | null = null;
-  private readonly delay: number;
-  private readonly model: string | null;
+  get canSteer(): boolean {
+    return this.midTurnInput;
+  }
+  /** Conversations (the fake's own sessions). */
+  readonly sessions = new Map<string, ConversationMessage[]>();
+  readonly turns: EngineTurn[] = [];
+  private current: string | null = null;
   private running = false;
   private cancelled = false;
-  private endedResolvers: (() => void)[] = [];
-  private readonly subagentDelay: number;
-  private readonly runningSubagents = new Set<string>();
-  private spawnedThisTurn: string[] = [];
-  /** Steers handed over and not yet taken into a step. */
   private steers: { id: string; input: InputMessage[] }[] = [];
-  /** Inputs steered so far (for assertions). */
-  readonly steeredInputs: InputMessage[] = [];
-  /** Turns started so far (for assertions). */
-  readonly turns: EngineTurn[] = [];
+  private subagents = 0;
+  private readonly midTurnInput: boolean;
+  private readonly delay: number;
+  private readonly subagentDelay: number;
 
-  constructor(opts: FakeEngineOptions) {
-    this.agentDir = opts.agentDir;
+  constructor(opts: FakeEngineOptions = {}) {
     this.midTurnInput = opts.midTurnInput ?? true;
     this.delay = opts.wordDelayMs ?? 5;
-    this.model = opts.model ?? "fake-1";
     this.subagentDelay = opts.subagentDelayMs ?? 30;
   }
 
-  async start(sessionId: string | null): Promise<void> {
-    this.sid = sessionId;
-    await fs.mkdir(path.join(this.agentDir, SESSION_DIR), { recursive: true });
-  }
-
-  private get transcriptPath(): string {
-    return path.join(this.agentDir, SESSION_DIR, `${this.sid}.jsonl`);
-  }
-
-  private async note(msg: HistoryMessage): Promise<void> {
-    await fs.appendFile(this.transcriptPath, `${JSON.stringify(msg)}\n`, "utf8");
-  }
+  async start(): Promise<void> {}
 
   async run(turn: Turn, req: EngineTurn): Promise<TurnEnd> {
-    if (this.running) throw new Error("fake engine: a turn is already running");
     if (turn.cancelRequested) return { status: "cancelled", error: null, usage: null };
     this.running = true;
     this.cancelled = false;
     this.turns.push(req);
     try {
-      if (!this.sid) {
-        this.sid = `fake-${randomBytes(6).toString("hex")}`;
-        await turn.sessionStarted(this.sid);
-      }
+      const id = req.conversation ?? `conv_fake_${randomBytes(6).toString("hex")}`;
+      if (!this.sessions.has(id)) this.sessions.set(id, []);
+      this.current = id;
+      turn.conversationStarted(id);
+      const log = this.sessions.get(id)!;
       const queue = [...req.input];
       let full = "";
-      while (queue.length > 0 && !this.cancelled) {
+      while (queue.length && !this.cancelled) {
         const item = queue.shift()!;
-        await this.note({ role: item.role === "user" ? "user" : "system", text: item.content, at: new Date().toISOString() });
-        if (item.content.includes("[perm]")) {
-          const decision = await turn.askPermission({ tool: "Bash", operation: { command: "echo perm" } });
-          const d = `permission ${decision}. `;
-          full += d;
-          turn.textDelta(d);
-          if (this.cancelled) break;
-        }
+        log.push({ role: "user", text: item.content });
         let steered = false;
         for (const w of `echo: ${item.content}`.split(" ")) {
           await sleep(this.delay);
@@ -110,9 +70,8 @@ export class FakeEngine implements Engine {
           const s = this.steers.shift();
           if (s) {
             turn.steerTakenIn(s.id);
-            this.steeredInputs.push(...s.input);
-            full = "";
             queue.unshift(...s.input);
+            full = "";
             steered = true;
             break;
           }
@@ -123,73 +82,54 @@ export class FakeEngine implements Engine {
         if (this.cancelled) break;
         if (steered) continue;
         if (item.content.includes("[tool]")) {
-          const id = `call_${randomBytes(4).toString("hex")}`;
-          turn.mcpCallStarted(id, { server: "fake", name: "fake_tool", arguments: { text: item.content } });
+          const call = `call_${randomBytes(4).toString("hex")}`;
+          turn.mcpCallStarted(call, { server: "fake", name: "fake_tool", arguments: { text: item.content } });
           await sleep(this.delay);
+          turn.mcpCallEnded(call, "ok", null);
+        }
+        if (item.content.includes("[approve]")) {
+          const ok = await turn.requestApproval({ server: "ext", name: "send", arguments: { text: item.content } });
           if (this.cancelled) break;
-          turn.mcpCallEnded(id, "ok", null);
+          full += ` approval ${ok ? "yes" : "no"}.`;
+          turn.textDelta(` approval ${ok ? "yes" : "no"}.`);
         }
         if (item.content.includes("[spawn]")) {
-          const id = `sub_${randomBytes(4).toString("hex")}`;
-          this.runningSubagents.add(id);
-          this.spawnedThisTurn.push(id);
+          this.subagents++;
+          setTimeout(() => this.subagents--, this.subagentDelay);
         }
         if (item.content.includes("[fail]")) return { status: "failed", error: "scripted failure", usage: null };
       }
       if (this.cancelled) return { status: "cancelled", error: null, usage: null };
-      if (full) await this.note({ role: "assistant", text: full, at: new Date().toISOString() });
+      log.push({ role: "assistant", text: full });
       turn.textDone(full);
       return { status: "completed", error: null, usage: usage(1, full.length) };
     } finally {
       this.running = false;
-      for (const r of this.endedResolvers) r();
-      this.endedResolvers = [];
       this.steers = [];
-      for (const id of this.spawnedThisTurn) setTimeout(() => this.runningSubagents.delete(id), this.subagentDelay);
-      this.spawnedThisTurn = [];
     }
   }
 
-  async steer(_turn: Turn, steer: QueuedSteer): Promise<boolean> {
+  async steer(_turn: Turn, id: string, input: InputMessage[]): Promise<boolean> {
     if (!this.running || !this.midTurnInput || this.cancelled) return false;
-    this.steers.push(steer); // taken at the next word
+    this.steers.push({ id, input });
     return true;
   }
 
   async cancel(): Promise<void> {
-    if (!this.running) return;
     this.cancelled = true;
-    await new Promise<void>((r) => this.endedResolvers.push(r));
   }
 
   state(): EngineState {
-    return { running: this.running, sessionId: this.sid, model: this.model, subagents: { running: this.runningSubagents.size, lost: [] }, subagentProfileApplied: false };
+    return { running: this.running, conversation: this.current, model: "fake-1", subagents: this.subagents };
   }
 
-  async history(): Promise<HistoryMessage[]> {
-    if (!this.sid) return [];
-    try {
-      const raw = await fs.readFile(this.transcriptPath, "utf8");
-      return raw
-        .split("\n")
-        .filter((l) => l.trim())
-        .map((l) => JSON.parse(l) as HistoryMessage);
-    } catch {
-      return [];
-    }
-  }
-
-  exportExcludes(): string[] {
-    return [`${SESSION_DIR}/*.index`];
-  }
-
-  sessionPaths(): string[] {
-    return [SESSION_DIR];
+  async conversation(id: string): Promise<ConversationMessage[] | null> {
+    return this.sessions.get(id) ?? null;
   }
 
   async stop(): Promise<void> {
-    if (this.running) await this.cancel();
+    this.cancelled = true;
   }
 }
 
-registerEngine({ name: "fake", needsSoul: false, create: (o: EngineOptions) => new FakeEngine({ agentDir: o.agentDir }) });
+registerEngine({ name: "fake", needsSoul: false, create: () => new FakeEngine() });

@@ -11,7 +11,9 @@ import * as readline from "node:readline";
 
 const socketPath = process.env.GREYFOLK_MCP_SOCKET;
 const httpPath = process.env.GREYFOLK_MCP_PATH || "/mcp";
-const extraHeaders: Record<string, string> = JSON.parse(process.env.GREYFOLK_MCP_HEADERS || "{}");
+// Headers come either inline or, so they stay out of any config file or argv, from a named variable.
+const headersVar = process.env.GREYFOLK_MCP_HEADERS_VAR;
+const extraHeaders: Record<string, string> = JSON.parse(process.env.GREYFOLK_MCP_HEADERS ?? (headersVar ? process.env[headersVar] : undefined) ?? "{}");
 
 if (!socketPath) {
   process.stderr.write("greyfolk unix-bridge: GREYFOLK_MCP_SOCKET is not set\n");

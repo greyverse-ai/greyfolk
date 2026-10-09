@@ -1,24 +1,18 @@
 /**
- * The HTTP surface (spec §2): `POST /v1/responses` (streaming or not), `GET /v1/responses/{id}`
- * (JSON or resumable SSE), `POST /v1/responses/{id}/cancel`, and the `greyfolk.*` extension
- * endpoints: `POST /greyfolk/export`, `POST /greyfolk/reset`,
- * `GET /greyfolk/history`, `POST /greyfolk/permissions/{id}`.
- * `GET /health` is the standard health check (the agent's state; see health.ts).
- * Every call needs the bearer key. The WebSocket upgrade on `/v1/responses` is handled in ws.ts.
+ * The HTTP controller: `POST /v1/responses` (streaming or not), `GET /v1/responses/{id}` (JSON or
+ * resumable SSE), `POST /v1/responses/{id}/cancel`, `GET /v1/conversations/{id}/items`, and the
+ * standard health check `GET /health`. Every call needs the bearer key. The WebSocket mode on
+ * `/v1/responses` is in ws.ts.
  */
 import * as http from "node:http";
-import type { CreateParams, AgentResponse, ResponsesApi } from "../api/types.js";
+import type { AgentResponse, CreateParams, ResponsesApi } from "../api/types.js";
+import { TERMINAL_EVENTS } from "../api/types.js";
 import { ApiError } from "../api/errors.js";
 import type { BearerAuth } from "./auth.js";
-import { SseWriter, TERMINAL_EVENTS } from "./sse.js";
+import { SseWriter } from "./sse.js";
 import { HEALTH_CONTENT_TYPE, toHealth } from "./health.js";
 
 const MAX_BODY = 16 * 1024 * 1024;
-
-export interface HttpHandlerOptions {
-  agent: ResponsesApi;
-  auth: BearerAuth;
-}
 
 export function readJsonBody(req: http.IncomingMessage): Promise<unknown> {
   return new Promise((resolve, reject) => {
@@ -54,104 +48,73 @@ function sendJson(res: http.ServerResponse, status: number, body: unknown, conte
 
 function sendError(res: http.ServerResponse, err: unknown): void {
   const e = ApiError.from(err);
-  if (res.headersSent) {
-    res.end();
-    return;
-  }
+  if (res.headersSent) return void res.end();
   sendJson(res, e.status, e.toBody());
 }
 
-/** Waits for the chain starting at `responseId` to reach a terminal response; resolves with that response. */
-export function waitForChainEnd(agent: ResponsesApi, responseId: string): Promise<AgentResponse> {
+/** Resolves with the terminal response of the chain that starts at `responseId`. */
+function chainEnd(agent: ResponsesApi, responseId: string): Promise<AgentResponse> {
   return new Promise((resolve) => {
     const unsub = agent.stream(responseId, -1, (ev) => {
-      if (TERMINAL_EVENTS.has(ev.type)) {
-        queueMicrotask(() => unsub());
-        resolve((ev as { response: AgentResponse }).response);
-      }
+      if (!TERMINAL_EVENTS.has(ev.type)) return;
+      // A steered response ends `incomplete` and its successor goes on: the chain ends later.
+      if (ev.type === "response.incomplete" && (ev as { response: AgentResponse }).response.incomplete_details?.reason === "steered") return;
+      queueMicrotask(() => unsub());
+      resolve((ev as { response: AgentResponse }).response);
     });
   });
 }
 
-/** Streams the chain from `startingAfter` over SSE; ends the stream at the terminal event. */
 function streamChain(agent: ResponsesApi, responseId: string, startingAfter: number, req: http.IncomingMessage, res: http.ServerResponse, cancelOnClose: boolean): void {
   const sse = new SseWriter(res);
   let done = false;
   const unsub = agent.stream(responseId, startingAfter, (ev) => {
     sse.send(ev);
-    if (TERMINAL_EVENTS.has(ev.type)) {
-      done = true;
-      queueMicrotask(() => unsub());
-      sse.end();
-    }
+    if (!TERMINAL_EVENTS.has(ev.type)) return;
+    // A steered response ends `incomplete` and its successor continues on the same stream.
+    if (ev.type === "response.incomplete" && (ev as { response: AgentResponse }).response.incomplete_details?.reason === "steered") return;
+    done = true;
+    queueMicrotask(() => unsub());
+    sse.end();
   });
-  req.on("close", () => {
-    if (done) return;
+  // The response side closes when the client goes away (the request side has closed already, once its body was read).
+  res.on("close", () => {
+    if (done || res.writableEnded) return;
     unsub();
     if (cancelOnClose) agent.cancelIfForeground(responseId).catch(() => {});
   });
 }
 
-export function createRequestHandler(opts: HttpHandlerOptions): (req: http.IncomingMessage, res: http.ServerResponse) => void {
-  const { agent, auth } = opts;
-  return (req, res) => {
-    handle(req, res).catch((err) => sendError(res, err));
-  };
+export function createRequestHandler(agent: ResponsesApi, auth: BearerAuth): (req: http.IncomingMessage, res: http.ServerResponse) => void {
+  return (req, res) => void handle(req, res).catch((err) => sendError(res, err));
 
   async function handle(req: http.IncomingMessage, res: http.ServerResponse): Promise<void> {
     if (!auth.check(req.headers.authorization)) throw ApiError.unauthorized();
     const url = new URL(req.url ?? "/", "http://greyfolk");
     const method = req.method ?? "GET";
     const parts = url.pathname.split("/").filter(Boolean);
-
+    if (parts.length === 1 && parts[0] === "health" && method === "GET") return sendJson(res, 200, toHealth(agent.state()), HEALTH_CONTENT_TYPE);
     if (parts[0] === "v1" && parts[1] === "responses") {
-      if (parts.length === 2 && method === "POST") return createResponse(req, res);
-      if (parts.length === 3 && method === "GET") return getResponse(req, res, parts[2]!, url);
-      if (parts.length === 4 && parts[3] === "cancel" && method === "POST") {
-        return sendJson(res, 200, await agent.cancel(parts[2]!));
+      if (parts.length === 2 && method === "POST") {
+        const body = (await readJsonBody(req)) as CreateParams;
+        const response = await agent.create(body);
+        if (body.stream === true) return streamChain(agent, response.id, -1, req, res, true);
+        // A background response is returned at once; the caller polls or re-attaches (the standard).
+        if (body.background === true) return sendJson(res, 200, response);
+        return sendJson(res, 200, await chainEnd(agent, response.id));
       }
+      if (parts.length === 3 && method === "GET") {
+        const response = agent.retrieve(parts[2]!);
+        if (url.searchParams.get("stream") !== "true") return sendJson(res, 200, response);
+        const after = Number(url.searchParams.get("starting_after") ?? "-1");
+        if (!Number.isInteger(after)) throw ApiError.invalid("'starting_after' must be an integer.", null, "starting_after");
+        return streamChain(agent, parts[2]!, after, req, res, false);
+      }
+      if (parts.length === 4 && parts[3] === "cancel" && method === "POST") return sendJson(res, 200, await agent.cancel(parts[2]!));
     }
-    if (parts.length === 1 && parts[0] === "health" && method === "GET") return sendJson(res, 200, toHealth(agent.status()), HEALTH_CONTENT_TYPE);
-    if (parts[0] === "greyfolk") {
-      if (parts[1] === "history" && method === "GET") return sendJson(res, 200, { object: "list", data: await agent.history() });
-      if (parts[1] === "export" && method === "POST") {
-        const body = (await readJsonBody(req)) as Record<string, unknown>;
-        if (typeof body.dest !== "string" || !body.dest) throw ApiError.invalid("'dest' (a path outside the agent folder) is required.", null, "dest");
-        return sendJson(res, 200, await agent.export(body.dest));
-      }
-      if (parts[1] === "reset" && method === "POST") {
-        await readJsonBody(req);
-        return sendJson(res, 200, await agent.reset());
-      }
-      if (parts[1] === "permissions" && parts.length === 3 && method === "POST") {
-        const body = (await readJsonBody(req)) as Record<string, unknown>;
-        if (body.decision !== "allow" && body.decision !== "deny") throw ApiError.invalid("'decision' must be 'allow' or 'deny'.", null, "decision");
-        return sendJson(res, 200, agent.decidePermission(parts[2]!, body.decision));
-      }
+    if (parts[0] === "v1" && parts[1] === "conversations" && parts.length === 4 && parts[3] === "items" && method === "GET") {
+      return sendJson(res, 200, await agent.conversationItems(parts[2]!));
     }
     throw ApiError.notFound(`No route for ${method} ${url.pathname}.`);
-  }
-
-  async function createResponse(req: http.IncomingMessage, res: http.ServerResponse): Promise<void> {
-    const body = (await readJsonBody(req)) as CreateParams;
-    const response = await agent.create(body);
-    if (body.stream === true) {
-      streamChain(agent, response.id, -1, req, res, true);
-      return;
-    }
-    // A background response is returned at once; the caller polls or re-attaches (the standard).
-    if (body.background === true) return sendJson(res, 200, response);
-    sendJson(res, 200, await waitForChainEnd(agent, response.id));
-  }
-
-  async function getResponse(req: http.IncomingMessage, res: http.ServerResponse, id: string, url: URL): Promise<void> {
-    const response = agent.retrieve(id);
-    if (url.searchParams.get("stream") === "true") {
-      const after = Number(url.searchParams.get("starting_after") ?? "-1");
-      if (!Number.isInteger(after)) throw ApiError.invalid("'starting_after' must be an integer.", null, "starting_after");
-      streamChain(agent, id, after, req, res, false);
-      return;
-    }
-    sendJson(res, 200, response);
   }
 }

@@ -18,6 +18,10 @@ export interface ParsedRequest {
   model: string | null;
   /** The new input items, in order (assistant items are never among them). */
   input: InputMessage[];
+  /** `mcp_approval_response` items: answers to approval requests the previous response ended with. */
+  approvals: { approval_request_id: string; approve: boolean }[];
+  /** The conversation (the engine's session) to continue, or null for a new one. */
+  conversation: string | null;
   instructions: string | null;
   previous_response_id: string | null;
   tools: McpTool[];
@@ -49,9 +53,25 @@ export function parseCreateRequest(body: CreateParams | unknown): ParsedRequest 
   const md = asRecord(b.metadata);
   if (md) for (const [k, v] of Object.entries(md)) metadata[k] = String(v);
 
+  const items = Array.isArray(b.input) ? (b.input as unknown[]) : null;
+  const approvals: ParsedRequest["approvals"] = [];
+  const rest: unknown[] = [];
+  for (const it of items ?? []) {
+    const r = asRecord(it);
+    if (r?.type === "mcp_approval_response") {
+      if (typeof r.approval_request_id !== "string" || typeof r.approve !== "boolean") throw ApiError.invalid("mcp_approval_response needs 'approval_request_id' and 'approve'.", "invalid_input", "input");
+      approvals.push({ approval_request_id: r.approval_request_id, approve: r.approve });
+    } else rest.push(it);
+  }
+  const conv = b.conversation;
+  const conversation = conv === undefined || conv === null ? null : typeof conv === "string" ? conv : typeof asRecord(conv)?.id === "string" ? (asRecord(conv)!.id as string) : null;
+  if (conv !== undefined && conv !== null && !conversation) throw ApiError.invalid("'conversation' must be an id or {id}.", null, "conversation");
+
   return {
     model,
-    input: selectNewItems(normaliseInput(b.input), previous !== null),
+    input: selectNewItems(normaliseInput(items ? rest : b.input), previous !== null || conversation !== null),
+    approvals,
+    conversation,
     instructions,
     previous_response_id: previous,
     tools,

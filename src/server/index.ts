@@ -16,8 +16,8 @@ export interface AgentServer {
 }
 
 export function createServer(agent: ResponsesApi, auth: BearerAuth): { server: http.Server; closeSockets: () => void } {
-  const server = http.createServer(createRequestHandler({ agent, auth }));
-  const ws = createWebSocketHandler({ agent, auth });
+  const server = http.createServer(createRequestHandler(agent, auth));
+  const ws = createWebSocketHandler(agent, auth);
   server.on("upgrade", ws.handleUpgrade);
   return { server, closeSockets: ws.close };
 }

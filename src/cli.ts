@@ -5,14 +5,13 @@
  */
 import * as path from "node:path";
 import { promises as fs } from "node:fs";
-import { AgentService } from "./service/agent-service.js";
+import { AgentService } from "./service/agent.js";
 import { BearerAuth, readKeyFromFd } from "./server/auth.js";
 import { parseSoul } from "./soul.js";
 import { startServer } from "./server/index.js";
 import { resolveOptions } from "./cli-options.js";
-import { CORE_OPTIONS, formatHelp, parseArgv, withDefaults } from "./options.js";
+import { CORE_OPTIONS, formatHelp, parseArgv, splitEngineArgs, withDefaults } from "./options.js";
 import { engineNames, engineOptions, getEngine } from "./engine/registry.js";
-import { loadSubagentProfile } from "./engine/subagent-profile.js";
 import { defaultToolAttacher } from "./mcp/translate.js";
 import "./engine/index.js";
 
@@ -40,29 +39,24 @@ async function readSoul(agentDir: string, override: string | undefined): Promise
 
 async function main(): Promise<void> {
   const specs = [...CORE_OPTIONS, ...engineOptions()];
-  const given = parseArgv(process.argv.slice(2), specs);
+  const { own, engine: engineArgs } = splitEngineArgs(process.argv.slice(2));
+  const given = parseArgv(own, specs);
   if (given.get("help") === true) {
     process.stdout.write(`${formatHelp(specs, engineNames())}\n`);
     return;
   }
-  const o = resolveOptions(withDefaults(specs, given), { readKeyFromFd }, engineNames());
+  const o = resolveOptions(withDefaults(specs, given), { readKeyFromFd }, engineNames(), engineArgs);
   const def = getEngine(o.engine);
   const auth = new BearerAuth(o.key);
   const soulRead = def.needsSoul ? await readSoul(o.agentDir, o.soulOverride) : { body: "", summary: `${o.engine} engine, no soul` };
-  const subagentProfile = o.subagentProfile ? await loadSubagentProfile(o.subagentProfile, o.agentDir) : null;
-  const startOptions = { agentDir: o.agentDir, soul: soulRead.body, disabledTools: new Set(o.disabledTools), exec: o.engineExec, values: o.values, subagentProfile };
-
   const agent = new AgentService({
-    createEngine: () => def.create(startOptions),
-    agentDir: o.agentDir,
+    engine: def.create({ agentDir: o.agentDir, soul: soulRead.body, engineArgs: o.engineArgs, exec: o.engineExec, values: o.values }),
     modelPolicy: o.modelPolicy,
-    resetArchiveDir: o.resetArchiveDir,
-    subagentProfileName: subagentProfile?.name ?? null,
     attachTools: defaultToolAttacher(),
   });
   await agent.init();
   const server = await startServer(agent, auth, o.listen);
-  process.stderr.write(`greyfolk listening on ${server.address} (engine=${o.engine}, tools off: ${o.disabledTools.join(",") || "none"}, agent=${o.agentDir}, soul: ${soulRead.summary})\n`);
+  process.stderr.write(`greyfolk listening on ${server.address} (engine=${o.engine}, engine options: ${o.engineArgs.join(" ") || "none"}, agent=${o.agentDir}, soul: ${soulRead.summary})\n`);
 
   const shutdown = async (): Promise<void> => {
     await server.close();

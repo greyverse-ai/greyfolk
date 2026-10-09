@@ -1,11 +1,12 @@
 export * from "./api/types.js";
 export { ApiError } from "./api/errors.js";
 export { parseCreateRequest, type InputMessage, type ParsedRequest } from "./api/input.js";
-export { AgentService, type AgentServiceOptions, type ModelPolicy } from "./service/agent-service.js";
-export type { Engine, EngineOptions, EngineState, EngineTurn } from "./engine/engine.js";
+export { AgentService, type AgentServiceOptions, type ModelPolicy } from "./service/agent.js";
+export { Turn, usage, type BuiltinCall, type TurnEnd } from "./service/turn.js";
+export type { Engine, EngineOptions, EngineState, EngineTurn, ConversationMessage } from "./engine/engine.js";
 export { registerEngine, getEngine, engineNames, type EngineDefinition } from "./engine/registry.js";
-export { Turn, usage, type TurnEnd } from "./common/turn.js";
 export { FakeEngine, type FakeEngineOptions } from "./engine/fake.js";
+export { defaultToolAttacher } from "./mcp/translate.js";
 export { BearerAuth, readKeyFromFd } from "./server/auth.js";
 export { parseListen, type ListenTarget } from "./server/listen.js";
 export { createServer, listen, startServer, type AgentServer } from "./server/index.js";

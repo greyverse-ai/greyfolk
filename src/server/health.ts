@@ -1,42 +1,23 @@
 /**
  * `GET /health`: the agent's state in the common health check format for HTTP APIs
- * (`application/health+json`, draft-inadarei-api-health-check): `status` pass | warn | fail and
- * one entry per check. The service's `status()` is the source; this only shapes it.
+ * (`application/health+json`, draft-inadarei-api-health-check). Busy is not unhealthy.
  */
-import type { AgentStatus } from "../api/types.js";
+import type { AgentState } from "../api/types.js";
 
 export const HEALTH_CONTENT_TYPE = "application/health+json";
 
-interface Check {
-  componentType: "component";
-  observedValue: unknown;
-  observedUnit?: string;
-  status: "pass" | "warn" | "fail";
-  output?: string;
-}
-
-export interface Health {
-  status: "pass" | "warn" | "fail";
-  serviceId: "greyfolk";
-  description: string;
-  checks: Record<string, Check[]>;
-}
-
-export function toHealth(s: AgentStatus): Health {
-  const pass = (observedValue: unknown, observedUnit?: string): Check[] => [{ componentType: "component", observedValue, ...(observedUnit ? { observedUnit } : {}), status: "pass" }];
-  const lost = s.subagents.lost.length;
+export function toHealth(s: AgentState) {
+  const check = (observedValue: unknown, observedUnit?: string) => [{ componentType: "component", observedValue, ...(observedUnit ? { observedUnit } : {}), status: "pass" }];
   return {
-    // Busy is not unhealthy; subagents the engine lost are worth a warning.
-    status: lost > 0 ? "warn" : "pass",
+    status: "pass",
     serviceId: "greyfolk",
     description: `one agent on the ${s.engine} engine`,
     checks: {
-      "agent:state": pass(s.state),
-      "agent:turn": pass(s.turn),
-      "agent:subagents": [{ componentType: "component", observedValue: s.subagents.running, observedUnit: "running", status: lost > 0 ? "warn" : "pass", ...(lost > 0 ? { output: `lost: ${s.subagents.lost.join(", ")}` } : {}) }],
-      "agent:permission_requests": pass(s.permission_requests),
-      "engine:session": pass({ engine: s.engine, model: s.model, session_id: s.session_id }),
-      "engine:subagent_profile": pass(s.subagent_profile),
+      "agent:busy": check(s.busy),
+      "agent:response": check(s.response_id),
+      "agent:subagents": check(s.subagents, "running"),
+      "agent:approvals": check(s.approvals),
+      "engine:conversation": check({ engine: s.engine, model: s.model, conversation: s.conversation }),
     },
   };
 }

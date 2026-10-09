@@ -2,16 +2,15 @@
  * Start options (spec §8) resolved from the one option table (`options.ts`), without side effects
  * so they can be tested.
  *
- * Fail closed: `--engine` is required (no silent default). Turning engine tools off is per kind
- * (`--disable-tools`) or all at once (`--no-host-tools`); an engine that cannot confirm what it
- * was told to turn off refuses to start. The bearer key comes only from an inherited file
- * descriptor (`--key-fd`): never argv, the environment or a file (spec §2).
+ * `--engine` is required (no silent default); the engine's own options come after `--`. The
+ * bearer key comes only from an inherited file descriptor (`--key-fd`): never argv, the
+ * environment or a file (spec §2).
  */
 import * as path from "node:path";
 import { parseListen, type ListenTarget } from "./server/listen.js";
 import { parseExecPrefix } from "./engine/process.js";
-import { TOOL_KINDS, type OptionValues, type ToolKind } from "./options.js";
-import type { ModelPolicy } from "./service/agent-service.js";
+import type { OptionValues } from "./options.js";
+import type { ModelPolicy } from "./service/agent.js";
 
 export interface StartOptions {
   listen: ListenTarget;
@@ -20,13 +19,10 @@ export interface StartOptions {
   engine: string;
   /** Launcher prefix the engine is started through (empty = greyfolk starts it itself). */
   engineExec: string[];
-  /** Kinds of the engine's own tools that are off. */
-  disabledTools: ToolKind[];
+  /** The engine's own options (after `--`), for its SDK as they are. */
+  engineArgs: string[];
   modelPolicy: ModelPolicy;
-  /** Path of the starter's subagent profile file, or null. */
-  subagentProfile: string | null;
   soulOverride: string | undefined;
-  resetArchiveDir: string;
   /** Every resolved option, for the engine's own options. */
   values: OptionValues;
 }
@@ -41,7 +37,7 @@ const str = (v: OptionValues, k: string): string | undefined => {
 };
 
 /** `engines`: the registered engine names (the caller passes them, so this stays free of side effects). */
-export function resolveOptions(v: OptionValues, keys: KeyReaders, engines: string[]): StartOptions {
+export function resolveOptions(v: OptionValues, keys: KeyReaders, engines: string[], engineArgs: string[] = []): StartOptions {
   const listenArg = str(v, "listen");
   if (!listenArg) throw new Error("--listen is required");
   const listen = parseListen(listenArg);
@@ -63,22 +59,16 @@ export function resolveOptions(v: OptionValues, keys: KeyReaders, engines: strin
   if (!engine) throw new Error(`--engine is required (${engines.join(", ")}); there is no default`);
   if (!engines.includes(engine)) throw new Error(`--engine must be one of: ${engines.join(", ")}`);
 
-  const listed = (v.get("disable-tools") as string[] | undefined) ?? [];
-  const disabledTools: ToolKind[] = v.get("no-host-tools") === true ? [...TOOL_KINDS] : TOOL_KINDS.filter((k) => listed.includes(k));
 
-  const profile = str(v, "subagent-profile");
-  const resetArchiveDir = path.resolve(str(v, "reset-archive") ?? path.join(path.dirname(agentDir), `${path.basename(agentDir)}.archive`));
   return {
     listen,
     agentDir,
     key,
     engine,
     engineExec: parseExecPrefix(str(v, "engine-exec")),
-    disabledTools,
+    engineArgs,
     modelPolicy: (str(v, "model") ?? "fixed") as ModelPolicy,
-    subagentProfile: profile ? path.resolve(profile) : null,
     soulOverride: str(v, "soul"),
-    resetArchiveDir,
     values: v,
   };
 }

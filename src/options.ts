@@ -4,9 +4,8 @@
  * options through the registry (`EngineDefinition.options`), so a new engine never edits this file.
  *
  * Each option has exactly one source: the start command of this greyfolk process, set by its
- * starter, fixed for the process's life. There is no config-file layer and no precedence between
- * sources. Where an option overlaps a setting in the engine's own files, the spec's settings map
- * (greyfolk.md §8.1) says which one decides and how.
+ * starter. Everything after `--` belongs to the engine: greyfolk hands it to the engine's SDK as
+ * it is. The engine's own settings files in the agent folder are read by the engine as usual.
  */
 
 export type OptionKind = "string" | "flag" | "list";
@@ -22,10 +21,6 @@ export interface OptionSpec {
   removed?: string;
 }
 
-/** Kinds of the engine's own tools that can be turned off one by one (`--disable-tools`). */
-export const TOOL_KINDS = ["shell", "files", "web", "browser", "images", "apps"] as const;
-export type ToolKind = (typeof TOOL_KINDS)[number];
-
 export const CORE_OPTIONS: OptionSpec[] = [
   { name: "listen", kind: "string", help: "where to listen: unix:PATH, tcp:HOST:PORT (PORT 0 = any) or fd:N (an inherited listening socket)" },
   { name: "socket-mode", kind: "string", help: "mode of a unix: listening socket (octal, default 0600)" },
@@ -33,16 +28,16 @@ export const CORE_OPTIONS: OptionSpec[] = [
   { name: "agent-dir", kind: "string", default: ".", help: "the agent folder" },
   { name: "engine", kind: "string", help: "the engine to run (required; see the list below)" },
   { name: "engine-exec", kind: "string", help: "a launcher prefix the engine is started through (e.g. a sandbox wrapper); without it greyfolk starts the engine itself" },
-  { name: "disable-tools", kind: "list", values: TOOL_KINDS, default: [], help: `kinds of the engine's own tools to turn off: ${TOOL_KINDS.join(", ")}` },
-  { name: "no-host-tools", kind: "flag", default: false, help: "turn off every kind of the engine's own tools (same as --disable-tools with all kinds); only the request's MCP tools reach anything" },
   { name: "model", kind: "string", values: ["fixed", "request"], default: "fixed", help: "fixed: a request's model is ignored; request: it may choose within the engine's family" },
-  { name: "subagent-profile", kind: "string", help: "a JSON file: the MCP tools (and, with host tools on, paths) native subagents may use" },
   { name: "soul", kind: "string", help: "the instruction file to use instead of AGENTS.md / CLAUDE.md in the agent folder" },
-  { name: "reset-archive", kind: "string", help: "where a reset moves the old session (outside the agent folder; default <agent>.archive)" },
   { name: "help", kind: "flag", default: false, help: "print this list" },
+  { name: "disable-tools", kind: "list", removed: "--disable-tools was removed: pass the engine's own options after --" },
+  { name: "no-host-tools", kind: "flag", removed: "--no-host-tools was removed: pass the engine's own options after -- (e.g. Claude Code's --tools)" },
   { name: "harness", kind: "string", removed: "--harness was renamed: name the engine with --engine" },
   { name: "harness-exec", kind: "string", removed: "--harness-exec was renamed: use --engine-exec" },
   { name: "dev-key", kind: "string", removed: "--dev-key was removed: the bearer key never travels in arguments; hand it over on an inherited file descriptor with --key-fd N" },
+  { name: "subagent-profile", kind: "string", removed: "--subagent-profile was removed: subagents are the engine's own (define them in the engine's settings in the agent folder)" },
+  { name: "reset-archive", kind: "string", removed: "--reset-archive was removed: a new conversation is a request without a conversation id" },
   { name: "key-file", kind: "string", removed: "--key-file was removed: the bearer key never lives in a file the sandbox might read; hand it over on an inherited file descriptor with --key-fd N (e.g. --key-fd 3 3<key)" },
 ];
 
@@ -69,6 +64,12 @@ function coerce(spec: OptionSpec, raw: string, where: string): string | boolean 
   const v = raw;
   if (spec.values && !spec.values.includes(v)) throw new Error(`--${spec.name} must be one of ${spec.values.join(", ")}`);
   return v;
+}
+
+/** Splits greyfolk's own options from the engine's (everything after `--`). */
+export function splitEngineArgs(argv: string[]): { own: string[]; engine: string[] } {
+  const i = argv.indexOf("--");
+  return i < 0 ? { own: argv, engine: [] } : { own: argv.slice(0, i), engine: argv.slice(i + 1) };
 }
 
 /** Parses `--name value`, `--name=value` and bare flags against the specs. */
@@ -113,6 +114,6 @@ export function formatHelp(specs: OptionSpec[], engines: string[]): string {
     const def = s.default !== undefined && s.default !== false && !(Array.isArray(s.default) && s.default.length === 0) ? ` (default ${String(s.default)})` : "";
     lines.push(`  --${s.name}${arg}`.padEnd(28) + (s.help ?? "") + def);
   }
-  lines.push("", `engines: ${engines.join(", ")}`);
+  lines.push("", `engines: ${engines.join(", ")}`, "", "greyfolk [options] --engine NAME [-- the engine's own options, passed to its SDK as they are]");
   return lines.join("\n");
 }

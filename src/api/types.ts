@@ -1,124 +1,74 @@
 /**
- * The service's surface: the OpenAI Responses API itself (create, stream, steer, cancel, retrieve).
- * The controller (server) speaks it outward; engines write into it with the same types; there is
- * no other model.
- *
- * Requests, items, response objects and stream events are the official SDK types
- * (`openai/resources/responses/responses`). Only greyfolk's own extensions (`greyfolk.*`)
- * are defined here, as small additions on top.
+ * The protocol: the OpenAI Responses API, with the official SDK's types (npm `openai`).
+ * greyfolk adds nothing of its own to it; its state is read through a standard health check.
  */
-import type {
-  Response,
-  ResponseCreateParamsBase,
-  ResponseSteerInput,
-  ResponseStreamEvent,
-  ResponseSteerAcceptedEvent,
-  ResponseSteerFailedEvent,
-  Tool,
-} from "openai/resources/responses/responses";
+import type { Response, ResponseCreateParamsBase, ResponseStreamEvent, ResponseSteerAcceptedEvent, ResponseSteerErrorCode, ResponseSteerFailedEvent, ResponseSteerInput, Tool } from "openai/resources/responses/responses";
+import type { ConversationItemList } from "openai/resources/conversations/items";
 
 export type * from "openai/resources/responses/responses";
+export type { ConversationItemList };
 
 /** The MCP tool entry of a request (the only tool type greyfolk takes). */
 export type McpTool = Tool.Mcp;
 
-// ---- greyfolk.* extensions -------------------------------------------------
+/** `POST /v1/responses` body. */
+export type CreateParams = ResponseCreateParamsBase & { stream?: boolean | null };
 
-/** `POST /v1/responses` body: the SDK params. */
-export type CreateParams = ResponseCreateParamsBase & {
-  stream?: boolean | null;
-};
+/** A response object as greyfolk serves it: the SDK's, with an engine failure's own message. */
+export type AgentResponse = Omit<Response, "error"> & { error: { code: string; message: string } | null };
 
-/**
- * A response object as greyfolk serves it. Same as the SDK's, except that failure codes and
- * incomplete reasons may be greyfolk's own (`engine_error`, `instance_stopped`).
- */
-export type AgentResponse = Omit<Response, "error" | "incomplete_details"> & {
-  error: { code: string; message: string } | null;
-  incomplete_details: { reason: string } | null;
-};
-
-/** Outcome of a steer: the input reached the model step, or the response ended first. */
-export type SteerResult = "taken_in" | "response_ended";
-
-export type PermissionDecision = "allow" | "deny";
-
-/** Stream events greyfolk adds to the Responses stream. */
-export type AgentStreamEvent =
-  | { type: "response.cancelled"; sequence_number: number; response: AgentResponse }
-  | { type: "greyfolk.steer_taken_in"; sequence_number: number; steer: { id: string; previous_response_id: string }; next_response_id: string }
-  | { type: "greyfolk.permission_request"; sequence_number: number; id: string; response_id: string; tool: string; operation: unknown }
-
-/**
- * Every event on a response's stream. Lifecycle events carry `AgentResponse` (the SDK
- * `Response` with greyfolk's wider error codes), so they are re-typed here.
- */
+/** Every event on a response's stream (lifecycle events carry `AgentResponse`; steer acceptance is the WebSocket mode's). */
 export type StreamEvent =
-  | Exclude<ResponseStreamEvent, { response: Response }>
-  | { [K in Extract<ResponseStreamEvent, { response: Response }>["type"]]: Omit<Extract<ResponseStreamEvent, { type: K }>, "response"> & { response: AgentResponse } }[Extract<ResponseStreamEvent, { response: Response }>["type"]]
   | ResponseSteerAcceptedEvent
-  | ResponseSteerFailedEvent
-  | AgentStreamEvent;
+  | Exclude<ResponseStreamEvent, { response: Response }>
+  | { [K in Extract<ResponseStreamEvent, { response: Response }>["type"]]: Omit<Extract<ResponseStreamEvent, { type: K }>, "response"> & { response: AgentResponse } }[Extract<ResponseStreamEvent, { response: Response }>["type"]];
 
 /** A stream event before the log numbers it. */
 export type UnnumberedEvent = StreamEvent extends infer E ? (E extends unknown ? Omit<E, "sequence_number"> : never) : never;
 
-export const TERMINAL_EVENTS: ReadonlySet<string> = new Set(["response.completed", "response.failed", "response.cancelled"]);
-
-export interface SteerOutcome {
-  steerId: string;
-  /** The response that was live when the steer arrived (null if none was). */
-  liveResponseId: string | null;
-  result: Promise<SteerResult>;
-}
-
-/** The agent's state; served as the checks of the standard health check (`GET /health`). */
-export interface AgentStatus {
-  state: "idle" | "busy";
-  engine: string;
-  model: string | null;
-  session_id: string | null;
-  turn: { id: string; response_id: string; responses: string[] } | null;
-  subagents: { running: number; lost: string[] };
-  subagent_profile: { name: string | null; applied: boolean };
-  permission_requests: { id: string; response_id: string }[];
-}
-
-/** `GET /greyfolk/history` entry, read back from the engine's own session file. */
-export interface HistoryMessage {
-  role: "user" | "assistant" | "system";
-  text: string;
-  at: string | null;
-}
+/** A response ends the stream with one of these (a cancelled one ends `incomplete`, status `cancelled`). */
+export const TERMINAL_EVENTS: ReadonlySet<string> = new Set(["response.completed", "response.failed", "response.incomplete"]);
 
 export type StreamListener = (event: StreamEvent) => void;
 
-/** The service the controller depends on (nothing else): the Responses API plus `greyfolk.*`. */
+/** Why steering input was not committed (the standard `response.steer.failed` error). */
+export interface SteerFailure {
+  code: ResponseSteerErrorCode;
+  message: string;
+}
+
+export interface SteerOutcome {
+  /** The steer's id once accepted (`response.steer.accepted` went out on the live response), else null. */
+  id: string | null;
+  /** Taken into the running turn (a successor response continues it), or why it was not. */
+  result: Promise<"taken_in" | SteerFailure>;
+}
+
+/** The agent's state, for the health check. */
+export interface AgentState {
+  busy: boolean;
+  engine: string;
+  model: string | null;
+  conversation: string | null;
+  /** The live response of the running turn. */
+  response_id: string | null;
+  subagents: number;
+  /** Approval requests waiting for an `mcp_approval_response`. */
+  approvals: string[];
+}
+
+/** What the controller depends on (nothing else): the Responses API. */
 export interface ResponsesApi {
-  /** The engine's name. */
-  readonly engine: string;
-
-  /** Prepares the agent folder and resumes the recorded session; throws if greyfolk must refuse to start. */
-  init(): Promise<void>;
-  close(): Promise<void>;
-
-  // ---- Responses API --------------------------------------------------------
-  /** Opens a turn; returns its first response (in progress). */
   create(params: CreateParams): Promise<AgentResponse>;
-  /** Streams a response from `startingAfter`, then its successors in the same turn (steer). Returns unsubscribe. */
+  /** Streams a response from `startingAfter`, then its successors in the same turn. Returns unsubscribe. */
   stream(responseId: string, startingAfter: number, listener: StreamListener): () => void;
-  /** Adds input to the running turn (`response.steer`). */
-  steer(previousResponseId: string, input: ResponseSteerInput): Promise<SteerOutcome>;
-  /** Cancels the response's turn if it is running; returns the response. */
-  cancel(responseId: string): Promise<AgentResponse>;
-  /** Cancels when the creating stream closed and the response is not `background`. */
-  cancelIfForeground(responseId: string): Promise<void>;
   retrieve(responseId: string): AgentResponse;
-
-  // ---- greyfolk.* extensions ---------------------------------------------------
-  decidePermission(id: string, decision: PermissionDecision): { id: string; decision: PermissionDecision };
-  status(): AgentStatus;
-  history(): Promise<HistoryMessage[]>;
-  export(dest: string): Promise<{ dest: string; excluded: string[] }>;
-  reset(): Promise<{ archived_to: string }>;
+  steer(previousResponseId: string, input: ResponseSteerInput): Promise<SteerOutcome>;
+  cancel(responseId: string): Promise<AgentResponse>;
+  /** Cancels when the stream that created the turn closed and it is not `background`. */
+  cancelIfForeground(responseId: string): Promise<void>;
+  /** `GET /v1/conversations/{id}/items`, read by the engine from its own session. */
+  conversationItems(conversationId: string): Promise<ConversationItemList>;
+  state(): AgentState;
+  close(): Promise<void>;
 }
