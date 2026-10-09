@@ -1,22 +1,22 @@
 /**
  * The HTTP surface (spec §2): `POST /v1/responses` (streaming or not), `GET /v1/responses/{id}`
  * (JSON or resumable SSE), `POST /v1/responses/{id}/cancel`, and the `greyfolk.*` extension
- * endpoints: `GET /greyfolk/status`, `POST /greyfolk/export`, `POST /greyfolk/reset`,
+ * endpoints: `POST /greyfolk/export`, `POST /greyfolk/reset`,
  * `GET /greyfolk/history`, `POST /greyfolk/permissions/{id}`.
+ * `GET /health` is the standard health check (the agent's state; see health.ts).
  * Every call needs the bearer key. The WebSocket upgrade on `/v1/responses` is handled in ws.ts.
  */
 import * as http from "node:http";
-import type { Agent } from "../profile/engine.js";
-import { ApiError } from "../profile/errors.js";
-import { parseCreateRequest } from "../profile/input.js";
-import type { ResponseRecord } from "../profile/responses.js";
+import type { CreateParams, AgentResponse, ResponsesApi } from "../api/types.js";
+import { ApiError } from "../api/errors.js";
 import type { BearerAuth } from "./auth.js";
 import { SseWriter, TERMINAL_EVENTS } from "./sse.js";
+import { HEALTH_CONTENT_TYPE, toHealth } from "./health.js";
 
 const MAX_BODY = 16 * 1024 * 1024;
 
 export interface HttpHandlerOptions {
-  agent: Agent;
+  agent: ResponsesApi;
   auth: BearerAuth;
 }
 
@@ -46,9 +46,9 @@ export function readJsonBody(req: http.IncomingMessage): Promise<unknown> {
   });
 }
 
-function sendJson(res: http.ServerResponse, status: number, body: unknown): void {
+function sendJson(res: http.ServerResponse, status: number, body: unknown, contentType = "application/json"): void {
   const data = JSON.stringify(body);
-  res.writeHead(status, { "content-type": "application/json; charset=utf-8", "content-length": Buffer.byteLength(data) });
+  res.writeHead(status, { "content-type": `${contentType}; charset=utf-8`, "content-length": Buffer.byteLength(data) });
   res.end(data);
 }
 
@@ -61,34 +61,34 @@ function sendError(res: http.ServerResponse, err: unknown): void {
   sendJson(res, e.status, e.toBody());
 }
 
-/** Waits for the chain starting at `record` to reach a terminal response; resolves with that response. */
-export function waitForChainEnd(agent: Agent, record: ResponseRecord): Promise<ResponseRecord> {
+/** Waits for the chain starting at `responseId` to reach a terminal response; resolves with that response. */
+export function waitForChainEnd(agent: ResponsesApi, responseId: string): Promise<AgentResponse> {
   return new Promise((resolve) => {
-    const unsub = agent.subscribeChain(record.id, -1, (rec, ev) => {
+    const unsub = agent.stream(responseId, -1, (ev) => {
       if (TERMINAL_EVENTS.has(ev.type)) {
-        queueMicrotask(unsub);
-        resolve(rec);
+        queueMicrotask(() => unsub());
+        resolve((ev as { response: AgentResponse }).response);
       }
     });
   });
 }
 
 /** Streams the chain from `startingAfter` over SSE; ends the stream at the terminal event. */
-function streamChain(agent: Agent, record: ResponseRecord, startingAfter: number, req: http.IncomingMessage, res: http.ServerResponse, cancelOnClose: boolean): void {
+function streamChain(agent: ResponsesApi, responseId: string, startingAfter: number, req: http.IncomingMessage, res: http.ServerResponse, cancelOnClose: boolean): void {
   const sse = new SseWriter(res);
   let done = false;
-  const unsub = agent.subscribeChain(record.id, startingAfter, (_rec, ev) => {
+  const unsub = agent.stream(responseId, startingAfter, (ev) => {
     sse.send(ev);
     if (TERMINAL_EVENTS.has(ev.type)) {
       done = true;
-      queueMicrotask(unsub);
+      queueMicrotask(() => unsub());
       sse.end();
     }
   });
   req.on("close", () => {
     if (done) return;
     unsub();
-    if (cancelOnClose) agent.cancelIfForeground(record.id).catch(() => {});
+    if (cancelOnClose) agent.cancelIfForeground(responseId).catch(() => {});
   });
 }
 
@@ -108,12 +108,11 @@ export function createRequestHandler(opts: HttpHandlerOptions): (req: http.Incom
       if (parts.length === 2 && method === "POST") return createResponse(req, res);
       if (parts.length === 3 && method === "GET") return getResponse(req, res, parts[2]!, url);
       if (parts.length === 4 && parts[3] === "cancel" && method === "POST") {
-        const rec = await agent.cancel(parts[2]!);
-        return sendJson(res, 200, rec.response);
+        return sendJson(res, 200, await agent.cancel(parts[2]!));
       }
     }
+    if (parts.length === 1 && parts[0] === "health" && method === "GET") return sendJson(res, 200, toHealth(agent.status()), HEALTH_CONTENT_TYPE);
     if (parts[0] === "greyfolk") {
-      if (parts[1] === "status" && method === "GET") return sendJson(res, 200, agent.status());
       if (parts[1] === "history" && method === "GET") return sendJson(res, 200, { object: "list", data: await agent.history() });
       if (parts[1] === "export" && method === "POST") {
         const body = (await readJsonBody(req)) as Record<string, unknown>;
@@ -134,25 +133,25 @@ export function createRequestHandler(opts: HttpHandlerOptions): (req: http.Incom
   }
 
   async function createResponse(req: http.IncomingMessage, res: http.ServerResponse): Promise<void> {
-    const body = parseCreateRequest(await readJsonBody(req));
-    const record = await agent.create(body);
-    if (body.stream) {
-      streamChain(agent, record, -1, req, res, true);
+    const body = (await readJsonBody(req)) as CreateParams;
+    const response = await agent.create(body);
+    if (body.stream === true) {
+      streamChain(agent, response.id, -1, req, res, true);
       return;
     }
-    const final = await waitForChainEnd(agent, record);
-    sendJson(res, 200, final.response);
+    // A background response is returned at once; the caller polls or re-attaches (the standard).
+    if (body.background === true) return sendJson(res, 200, response);
+    sendJson(res, 200, await waitForChainEnd(agent, response.id));
   }
 
   async function getResponse(req: http.IncomingMessage, res: http.ServerResponse, id: string, url: URL): Promise<void> {
-    const rec = agent.responses.get(id);
-    if (!rec) throw ApiError.notFound(`Response '${id}' not found.`, "response_id");
+    const response = agent.retrieve(id);
     if (url.searchParams.get("stream") === "true") {
       const after = Number(url.searchParams.get("starting_after") ?? "-1");
       if (!Number.isInteger(after)) throw ApiError.invalid("'starting_after' must be an integer.", null, "starting_after");
-      streamChain(agent, rec, after, req, res, false);
+      streamChain(agent, id, after, req, res, false);
       return;
     }
-    sendJson(res, 200, rec.response);
+    sendJson(res, 200, response);
   }
 }

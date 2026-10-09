@@ -1,31 +1,33 @@
 /**
- * Session handling (spec §3).
+ * Session record (spec §3).
  *
  * - The session is the engine's own file; greyfolk keeps no copy.
  * - The current session id lives in `.greyfolk/session` in the agent folder.
- * - A record of fed input hashes (`.greyfolk/seen-inputs`) lets resent history be skipped.
  * - `.greyfolk/inflight` names the response that was running, so a cut-off response is reported failed.
- * - `.greyfolk/held` keeps subagent results that arrived after their response ended (spec §5).
+ * - `.greyfolk/latest` names the newest response, so a client can continue after a restart.
+ * - Every write goes through one queue and is atomic (temp file + rename), so writes never interleave.
  * - Reset moves the engine's session paths out of the agent's reach (to an archive dir outside the folder).
  * - Export copies the agent folder when fully idle, leaving out what the engine rebuilds.
  */
 import { promises as fs } from "node:fs";
 import * as path from "node:path";
+import { escapeRe, exists, isInside, writeAtomic } from "./fsutil.js";
 
 export const GREYFOLK_DIR = ".greyfolk";
 
-export interface HeldResult {
-  id: string;
-  status: "completed" | "failed" | "stopped";
-  output: string;
-  /** When greyfolk took it in (ISO 8601). */
-  at: string;
-}
 
-export class SessionStore {
+/** The session record in `.greyfolk/` (engine-neutral; every engine uses it). */
+export class SessionRecord {
   readonly agentDir: string;
   readonly dir: string;
-  private readonly seen = new Set<string>();
+  private queue: Promise<unknown> = Promise.resolve();
+
+  /** Runs `fn` after every earlier write has finished. */
+  private serial<T>(fn: () => Promise<T>): Promise<T> {
+    const run = this.queue.then(fn, fn);
+    this.queue = run.catch(() => {});
+    return run;
+  }
 
   constructor(agentDir: string) {
     this.agentDir = path.resolve(agentDir);
@@ -35,12 +37,6 @@ export class SessionStore {
   async init(): Promise<void> {
     await fs.mkdir(this.dir, { recursive: true });
     await fs.mkdir(path.join(this.dir, "run"), { recursive: true });
-    try {
-      const raw = await fs.readFile(path.join(this.dir, "seen-inputs"), "utf8");
-      for (const line of raw.split("\n")) if (line.trim()) this.seen.add(line.trim());
-    } catch {
-      /* none yet */
-    }
   }
 
   get sessionFile(): string {
@@ -56,19 +52,20 @@ export class SessionStore {
     }
   }
 
-  async writeSessionId(id: string): Promise<void> {
-    await fs.writeFile(this.sessionFile, `${id}\n`, "utf8");
+  writeSessionId(id: string): Promise<void> {
+    return this.serial(() => writeAtomic(this.sessionFile, `${id}\n`));
   }
 
-  hasSeen(hash: string): boolean {
-    return this.seen.has(hash);
+  async readLatest(): Promise<string | null> {
+    try {
+      return (await fs.readFile(path.join(this.dir, "latest"), "utf8")).trim() || null;
+    } catch {
+      return null;
+    }
   }
 
-  async markSeen(hashes: string[]): Promise<void> {
-    const fresh = hashes.filter((h) => !this.seen.has(h));
-    if (fresh.length === 0) return;
-    for (const h of fresh) this.seen.add(h);
-    await fs.appendFile(path.join(this.dir, "seen-inputs"), fresh.map((h) => `${h}\n`).join(""), "utf8");
+  writeLatest(responseId: string): Promise<void> {
+    return this.serial(() => writeAtomic(path.join(this.dir, "latest"), `${responseId}\n`));
   }
 
   async readInflight(): Promise<string | null> {
@@ -80,33 +77,9 @@ export class SessionStore {
     }
   }
 
-  async writeInflight(responseId: string | null): Promise<void> {
+  writeInflight(responseId: string | null): Promise<void> {
     const p = path.join(this.dir, "inflight");
-    if (responseId === null) {
-      await fs.rm(p, { force: true });
-    } else {
-      await fs.writeFile(p, `${responseId}\n`, "utf8");
-    }
-  }
-
-  /** Held subagent results keyed by the first response id of the turn that spawned them (spec §5). */
-  async readHeld(): Promise<Record<string, HeldResult[]>> {
-    try {
-      const raw = await fs.readFile(path.join(this.dir, "held"), "utf8");
-      const parsed = JSON.parse(raw) as Record<string, HeldResult[]>;
-      return parsed && typeof parsed === "object" ? parsed : {};
-    } catch {
-      return {};
-    }
-  }
-
-  async writeHeld(held: Record<string, HeldResult[]>): Promise<void> {
-    const p = path.join(this.dir, "held");
-    if (Object.keys(held).length === 0) {
-      await fs.rm(p, { force: true });
-    } else {
-      await fs.writeFile(p, `${JSON.stringify(held)}\n`, "utf8");
-    }
+    return this.serial(() => (responseId === null ? fs.rm(p, { force: true }) : writeAtomic(p, `${responseId}\n`)));
   }
 
   /**
@@ -119,7 +92,7 @@ export class SessionStore {
     const stamp = new Date().toISOString().replace(/[:.]/g, "-");
     const target = path.join(archive, stamp);
     await fs.mkdir(target, { recursive: true });
-    const toMove = [...sessionPaths, path.join(GREYFOLK_DIR, "session"), path.join(GREYFOLK_DIR, "seen-inputs"), path.join(GREYFOLK_DIR, "inflight"), path.join(GREYFOLK_DIR, "held")];
+    const toMove = [...sessionPaths, path.join(GREYFOLK_DIR, "session"), path.join(GREYFOLK_DIR, "inflight"), path.join(GREYFOLK_DIR, "latest")];
     for (const rel of toMove) {
       const src = path.join(this.agentDir, rel);
       if (!isInside(this.agentDir, src)) throw new Error(`session path escapes the agent folder: ${rel}`);
@@ -128,7 +101,6 @@ export class SessionStore {
       await fs.mkdir(path.dirname(dst), { recursive: true });
       await moveAcross(src, dst);
     }
-    this.seen.clear();
     return target;
   }
 
@@ -163,24 +135,6 @@ function toMatcher(pattern: string): (rel: string) => boolean {
     const r = rel.split(path.sep).join("/");
     return re.test(r) || re.test(path.posix.basename(r));
   };
-}
-
-function escapeRe(s: string): string {
-  return s.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
-}
-
-export function isInside(parent: string, child: string): boolean {
-  const rel = path.relative(parent, child);
-  return rel === "" || (!rel.startsWith("..") && !path.isAbsolute(rel));
-}
-
-async function exists(p: string): Promise<boolean> {
-  try {
-    await fs.lstat(p);
-    return true;
-  } catch {
-    return false;
-  }
 }
 
 async function moveAcross(src: string, dst: string): Promise<void> {

@@ -1,89 +1,84 @@
 /**
- * CLI start options (spec §8), resolved without side effects so they can be tested.
+ * Start options (spec §8) resolved from the one option table (`options.ts`), without side effects
+ * so they can be tested.
  *
- *   greyfolk --listen unix:/path|tcp:host:port|fd:N --key-fd N --agent-dir DIR
- *            --harness fake|claude|codex --harness-exec "<launcher>" [--model fixed|request]
- *            [--subagent-profile NAME] [--soul FILE] [--reset-archive DIR] [--socket-mode OCTAL]
- *
- * Fail closed: `--harness` is required (no silent default), and `claude`/`codex` refuse to start
- * without `--harness-exec` (the sandbox launcher). Only `fake` may run without one. The bearer key
- * comes only from an inherited file descriptor (`--key-fd`): never argv, the environment or a file
- * (spec §2 — a file is something the sandbox might read).
+ * Fail closed: `--engine` is required (no silent default). Turning engine tools off is per kind
+ * (`--disable-tools`) or all at once (`--no-host-tools`); an engine that cannot confirm what it
+ * was told to turn off refuses to start. The bearer key comes only from an inherited file
+ * descriptor (`--key-fd`): never argv, the environment or a file (spec §2).
  */
 import * as path from "node:path";
 import { parseListen, type ListenTarget } from "./server/listen.js";
-import { checkExecPrefix, parseExecPrefix } from "./harness/exec.js";
-
-export type HarnessName = "fake" | "claude" | "codex";
-export type ModelPolicy = "fixed" | "request";
+import { parseExecPrefix } from "./engine/process.js";
+import { TOOL_KINDS, type OptionValues, type ToolKind } from "./options.js";
+import type { ModelPolicy } from "./service/agent-service.js";
 
 export interface StartOptions {
   listen: ListenTarget;
   agentDir: string;
   key: string;
-  harnessName: HarnessName;
-  execPrefix: string[];
+  engine: string;
+  /** Launcher prefix the engine is started through (empty = greyfolk starts it itself). */
+  engineExec: string[];
+  /** Kinds of the engine's own tools that are off. */
+  disabledTools: ToolKind[];
   modelPolicy: ModelPolicy;
+  /** Path of the starter's subagent profile file, or null. */
   subagentProfile: string | null;
   soulOverride: string | undefined;
   resetArchiveDir: string;
+  /** Every resolved option, for the engine's own options. */
+  values: OptionValues;
 }
 
 export interface KeyReaders {
   readKeyFromFd(fd: number): string;
 }
 
-export function parseArgs(argv: string[]): Map<string, string> {
-  const out = new Map<string, string>();
-  for (let i = 0; i < argv.length; i++) {
-    const a = argv[i]!;
-    if (!a.startsWith("--")) throw new Error(`unexpected argument '${a}'`);
-    const eq = a.indexOf("=");
-    if (eq > 0) {
-      out.set(a.slice(2, eq), a.slice(eq + 1));
-    } else {
-      const v = argv[i + 1];
-      if (v === undefined || v.startsWith("--")) throw new Error(`--${a.slice(2)} needs a value`);
-      out.set(a.slice(2), v);
-      i++;
-    }
-  }
-  return out;
-}
+const str = (v: OptionValues, k: string): string | undefined => {
+  const x = v.get(k);
+  return typeof x === "string" ? x : undefined;
+};
 
-export function resolveOptions(args: Map<string, string>, keys: KeyReaders): StartOptions {
-  const listenArg = args.get("listen");
+/** `engines`: the registered engine names (the caller passes them, so this stays free of side effects). */
+export function resolveOptions(v: OptionValues, keys: KeyReaders, engines: string[]): StartOptions {
+  const listenArg = str(v, "listen");
   if (!listenArg) throw new Error("--listen is required");
   const listen = parseListen(listenArg);
-  if (listen.kind === "unix" && args.has("socket-mode")) {
-    const mode = parseInt(args.get("socket-mode")!, 8);
+  const socketMode = str(v, "socket-mode");
+  if (listen.kind === "unix" && socketMode !== undefined) {
+    const mode = parseInt(socketMode, 8);
     if (!Number.isInteger(mode) || mode < 0 || mode > 0o777) throw new Error("--socket-mode must be an octal mode like 0600");
     listen.mode = mode;
   }
-  const agentDir = path.resolve(args.get("agent-dir") ?? ".");
+  const agentDir = path.resolve(str(v, "agent-dir") ?? ".");
 
-  if (args.has("dev-key")) throw new Error("--dev-key was removed: the bearer key never travels in arguments; hand it over on an inherited file descriptor with --key-fd N");
-  if (args.has("key-file")) throw new Error("--key-file was removed: the bearer key never lives in a file the sandbox might read; hand it over on an inherited file descriptor with --key-fd N (e.g. --key-fd 3 3<key)");
-  const keyFd = args.get("key-fd");
+  const keyFd = str(v, "key-fd");
   if (!keyFd) throw new Error("--key-fd N is required (the bearer key arrives on an inherited file descriptor)");
   const fd = Number(keyFd);
   if (!Number.isInteger(fd) || fd < 0) throw new Error("--key-fd needs a file descriptor number");
   const key = keys.readKeyFromFd(fd);
 
-  const modelPolicy = (args.get("model") ?? "fixed") as ModelPolicy;
-  if (modelPolicy !== "fixed" && modelPolicy !== "request") throw new Error("--model must be 'fixed' or 'request'");
+  const engine = str(v, "engine");
+  if (!engine) throw new Error(`--engine is required (${engines.join(", ")}); there is no default`);
+  if (!engines.includes(engine)) throw new Error(`--engine must be one of: ${engines.join(", ")}`);
 
-  const harnessName = args.get("harness") as HarnessName | undefined;
-  if (!harnessName) throw new Error("--harness is required ('fake', 'claude' or 'codex'); there is no default");
-  if (!["fake", "claude", "codex"].includes(harnessName)) throw new Error("--harness must be 'fake', 'claude' or 'codex'");
+  const listed = (v.get("disable-tools") as string[] | undefined) ?? [];
+  const disabledTools: ToolKind[] = v.get("no-host-tools") === true ? [...TOOL_KINDS] : TOOL_KINDS.filter((k) => listed.includes(k));
 
-  const execPrefix = parseExecPrefix(args.get("harness-exec"));
-  if (harnessName !== "fake" && execPrefix.length === 0) {
-    throw new Error(`--harness ${harnessName} needs --harness-exec <launcher>: the engine is started only through the sandbox launcher (fail closed)`);
-  }
-  checkExecPrefix(execPrefix);
-
-  const subagentProfile = args.get("subagent-profile") ?? null;
-  const resetArchiveDir = path.resolve(args.get("reset-archive") ?? path.join(path.dirname(agentDir), `${path.basename(agentDir)}.archive`));
-  return { listen, agentDir, key, harnessName, execPrefix, modelPolicy, subagentProfile, soulOverride: args.get("soul"), resetArchiveDir };
+  const profile = str(v, "subagent-profile");
+  const resetArchiveDir = path.resolve(str(v, "reset-archive") ?? path.join(path.dirname(agentDir), `${path.basename(agentDir)}.archive`));
+  return {
+    listen,
+    agentDir,
+    key,
+    engine,
+    engineExec: parseExecPrefix(str(v, "engine-exec")),
+    disabledTools,
+    modelPolicy: (str(v, "model") ?? "fixed") as ModelPolicy,
+    subagentProfile: profile ? path.resolve(profile) : null,
+    soulOverride: str(v, "soul"),
+    resetArchiveDir,
+    values: v,
+  };
 }

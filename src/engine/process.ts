@@ -1,6 +1,6 @@
 /**
- * `--harness-exec <launcher>`: a prefix the starter supplies (the sandbox launcher).
- * The engine program is started only through it; if it fails, greyfolk exits (fail closed).
+ * Engine processes: started as greyfolk's own children in their own process group (so cancel can
+ * kill the group), optionally through a launcher prefix the starter supplies (`--engine-exec`).
  */
 import { spawn, type ChildProcess, type SpawnOptions } from "node:child_process";
 import { accessSync, constants } from "node:fs";
@@ -15,19 +15,17 @@ export function parseExecPrefix(value: string | undefined): string[] {
   return out;
 }
 
+/** Fails if the launcher named by a path is not executable (fail closed before serving). */
 export function checkExecPrefix(prefix: string[]): void {
   if (prefix.length === 0) return;
   const launcher = prefix[0]!;
-  if (launcher.includes("/")) {
-    accessSync(launcher, constants.X_OK);
-  }
+  if (launcher.includes("/")) accessSync(launcher, constants.X_OK);
 }
 
-/** Spawns `prefix... command args...` in its own process group so the group can be killed. */
-export function spawnThrough(prefix: string[], command: string, args: string[], options: SpawnOptions): ChildProcess {
+/** Spawns `prefix... command args...` in its own process group. */
+export function spawnGroup(prefix: string[], command: string, args: string[], options: SpawnOptions): ChildProcess {
   const argv = [...prefix, command, ...args];
-  const child = spawn(argv[0]!, argv.slice(1), { ...options, detached: process.platform !== "win32" });
-  return child;
+  return spawn(argv[0]!, argv.slice(1), { ...options, detached: process.platform !== "win32" });
 }
 
 /** Kills the process group of `child` (falls back to the process itself). */

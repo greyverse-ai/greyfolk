@@ -1,7 +1,7 @@
 /**
  * stdio ⇄ MCP streamable HTTP over a Unix socket.
  *
- * Started by the harness as a stdio MCP server. Each JSON-RPC message read from stdin is POSTed
+ * Started by the engine as a stdio MCP server. Each JSON-RPC message read from stdin is POSTed
  * to the socket (env GREYFOLK_MCP_SOCKET) at the HTTP path (GREYFOLK_MCP_PATH) with the headers
  * in GREYFOLK_MCP_HEADERS (JSON). Responses — a JSON body or an SSE stream — are written to stdout
  * one JSON-RPC message per line. The `Mcp-Session-Id` the server assigns on `initialize` is kept.

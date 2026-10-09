@@ -4,17 +4,17 @@
  * Option parsing and the fail-closed rules live in `cli-options.ts`.
  */
 import * as path from "node:path";
-import { Agent } from "./profile/engine.js";
-import { SessionStore } from "./session/store.js";
+import { promises as fs } from "node:fs";
+import { AgentService } from "./service/agent-service.js";
 import { BearerAuth, readKeyFromFd } from "./server/auth.js";
 import { parseSoul } from "./soul.js";
 import { startServer } from "./server/index.js";
-import { promises as fs } from "node:fs";
-import { FakeHarness } from "./harness/fake.js";
-import { ClaudeHarness } from "./harness/claude.js";
-import { CodexHarness } from "./harness/codex.js";
-import { parseArgs, resolveOptions } from "./cli-options.js";
-import type { Harness, HarnessStartOptions } from "./harness/types.js";
+import { resolveOptions } from "./cli-options.js";
+import { CORE_OPTIONS, formatHelp, parseArgv, withDefaults } from "./options.js";
+import { engineNames, engineOptions, getEngine } from "./engine/registry.js";
+import { loadSubagentProfile } from "./engine/subagent-profile.js";
+import { defaultToolAttacher } from "./mcp/translate.js";
+import "./engine/index.js";
 
 /**
  * The soul: the agent's instruction file in the folder (spec §1). Its metadata header is parsed and
@@ -39,33 +39,30 @@ async function readSoul(agentDir: string, override: string | undefined): Promise
 }
 
 async function main(): Promise<void> {
-  const o = resolveOptions(parseArgs(process.argv.slice(2)), { readKeyFromFd });
-  const { agentDir, harnessName, execPrefix, modelPolicy, subagentProfile, resetArchiveDir } = o;
+  const specs = [...CORE_OPTIONS, ...engineOptions()];
+  const given = parseArgv(process.argv.slice(2), specs);
+  if (given.get("help") === true) {
+    process.stdout.write(`${formatHelp(specs, engineNames())}\n`);
+    return;
+  }
+  const o = resolveOptions(withDefaults(specs, given), { readKeyFromFd }, engineNames());
+  const def = getEngine(o.engine);
   const auth = new BearerAuth(o.key);
-  const soulRead = harnessName === "fake" ? { body: "", summary: "fake harness, no soul" } : await readSoul(agentDir, o.soulOverride);
-  const soul = soulRead.body;
+  const soulRead = def.needsSoul ? await readSoul(o.agentDir, o.soulOverride) : { body: "", summary: `${o.engine} engine, no soul` };
+  const subagentProfile = o.subagentProfile ? await loadSubagentProfile(o.subagentProfile, o.agentDir) : null;
+  const startOptions = { agentDir: o.agentDir, soul: soulRead.body, disabledTools: new Set(o.disabledTools), exec: o.engineExec, values: o.values, subagentProfile };
 
-  const harnessFactory = (sessionId: string | null): Harness => {
-    if (harnessName === "fake") return new FakeHarness({ agentDir, sessionId });
-    const start: HarnessStartOptions = {
-      agentDir,
-      soul,
-      sessionId,
-      harnessExec: execPrefix,
-      model: null,
-      subagentProfile,
-      onSessionId: () => {
-        /* the engine reports the session id through the `session` event; the Agent records it */
-      },
-    };
-    if (harnessName === "claude") return new ClaudeHarness(start);
-    return new CodexHarness(start);
-  };
-
-  const agent = new Agent({ harnessFactory, store: new SessionStore(agentDir), modelPolicy, resetArchiveDir });
+  const agent = new AgentService({
+    createEngine: () => def.create(startOptions),
+    agentDir: o.agentDir,
+    modelPolicy: o.modelPolicy,
+    resetArchiveDir: o.resetArchiveDir,
+    subagentProfileName: subagentProfile?.name ?? null,
+    attachTools: defaultToolAttacher(),
+  });
   await agent.init();
   const server = await startServer(agent, auth, o.listen);
-  process.stderr.write(`greyfolk listening on ${server.address} (harness=${harnessName}, agent=${agentDir}, soul: ${soulRead.summary})\n`);
+  process.stderr.write(`greyfolk listening on ${server.address} (engine=${o.engine}, tools off: ${o.disabledTools.join(",") || "none"}, agent=${o.agentDir}, soul: ${soulRead.summary})\n`);
 
   const shutdown = async (): Promise<void> => {
     await server.close();

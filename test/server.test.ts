@@ -5,11 +5,11 @@ import * as path from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
 import WebSocket from "ws";
 import { BearerAuth } from "../src/server/auth.js";
-import { startServer, type GreyfolkServer } from "../src/server/index.js";
+import { startServer, type AgentServer } from "../src/server/index.js";
 import { sleep, tmpAgent } from "./helpers.js";
 
 const KEY = "test-key-not-real";
-let servers: GreyfolkServer[] = [];
+let servers: AgentServer[] = [];
 
 afterEach(async () => {
   for (const s of servers) await s.close();
@@ -35,9 +35,9 @@ function parseSse(text: string): Record<string, unknown>[] {
 describe("HTTP surface", () => {
   it("rejects calls without the bearer key", async () => {
     const { base } = await boot();
-    const r = await fetch(`${base}/greyfolk/status`);
+    const r = await fetch(`${base}/health`);
     expect(r.status).toBe(401);
-    const r2 = await fetch(`${base}/greyfolk/status`, { headers: { authorization: "Bearer wrong" } });
+    const r2 = await fetch(`${base}/health`, { headers: { authorization: "Bearer wrong" } });
     expect(r2.status).toBe(401);
   });
 
@@ -68,20 +68,41 @@ describe("HTTP surface", () => {
     expect(body.status).toBe("completed");
   });
 
-  it("cancel endpoint and status/permissions/history extensions", async () => {
+  it("GET /health is the standard health check format with the agent's state as checks", async () => {
+    const { base, headers } = await boot();
+    const r = await fetch(`${base}/health`, { headers });
+    expect(r.headers.get("content-type")).toContain("application/health+json");
+    const h = (await r.json()) as { status: string; serviceId: string; checks: Record<string, { observedValue: unknown; status: string }[]> };
+    expect(h.status).toBe("pass");
+    expect(h.serviceId).toBe("greyfolk");
+    expect(h.checks["agent:state"]![0]!.observedValue).toBe("idle");
+    expect(h.checks["agent:subagents"]![0]!.observedValue).toBe(0);
+  });
+
+  it("a non-streaming background request returns at once (in_progress); the caller polls", async () => {
+    const { base, headers } = await boot({ wordDelayMs: 15 });
+    const r = (await (await fetch(`${base}/v1/responses`, { method: "POST", headers, body: JSON.stringify({ input: "alpha beta gamma delta", background: true }) })).json()) as { id: string; status: string };
+    expect(r.status).toBe("in_progress");
+    await sleep(200);
+    expect(((await (await fetch(`${base}/v1/responses/${r.id}`, { headers })).json()) as { status: string }).status).toBe("completed");
+  });
+
+  it("cancel endpoint and health/permissions/history extensions", async () => {
     const { base, headers } = await boot({ wordDelayMs: 15 });
     const r = await fetch(`${base}/v1/responses`, { method: "POST", headers, body: JSON.stringify({ input: "[perm] alpha beta gamma", stream: true, background: true }) });
     const reader = r.body!.getReader();
     await sleep(30);
-    const st = (await (await fetch(`${base}/greyfolk/status`, { headers })).json()) as { state: string; permission_requests: { id: string }[] };
-    expect(st.state).toBe("busy");
-    expect(st.permission_requests).toHaveLength(1);
-    const pr = await fetch(`${base}/greyfolk/permissions/${st.permission_requests[0]!.id}`, { method: "POST", headers, body: JSON.stringify({ decision: "deny" }) });
+    const checks = async () => ((await (await fetch(`${base}/health`, { headers })).json()) as { checks: Record<string, { observedValue: unknown }[]> }).checks;
+    const st = await checks();
+    expect(st["agent:state"]![0]!.observedValue).toBe("busy");
+    const pending = st["agent:permission_requests"]![0]!.observedValue as { id: string }[];
+    expect(pending).toHaveLength(1);
+    const pr = await fetch(`${base}/greyfolk/permissions/${pending[0]!.id}`, { method: "POST", headers, body: JSON.stringify({ decision: "deny" }) });
     expect(pr.status).toBe(200);
     await sleep(10);
-    const turn = (await (await fetch(`${base}/greyfolk/status`, { headers })).json()) as { turn: { response_id: string } | null };
-    if (turn.turn) {
-      const c = await fetch(`${base}/v1/responses/${turn.turn.response_id}/cancel`, { method: "POST", headers });
+    const turn = (await checks())["agent:turn"]![0]!.observedValue as { response_id: string } | null;
+    if (turn) {
+      const c = await fetch(`${base}/v1/responses/${turn.response_id}/cancel`, { method: "POST", headers });
       expect(["cancelled", "completed"]).toContain(((await c.json()) as { status: string }).status);
     }
     reader.cancel().catch(() => {});
@@ -133,7 +154,7 @@ describe("WebSocket surface", () => {
     await done;
     const types = events.map((e) => e.type);
     expect(types).toContain("response.steer.accepted");
-    expect(types).toContain("response.steer.taken_in");
+    expect(types).toContain("greyfolk.steer_taken_in");
     expect(types.filter((t) => t === "response.created").length).toBe(2);
     expect(types).toContain("response.incomplete");
     expect(agent.status().state).toBe("idle");
@@ -142,7 +163,7 @@ describe("WebSocket surface", () => {
       const ev = JSON.parse(raw.toString()) as Record<string, unknown>;
       if (ev.type === "response.steer.failed") resolve(ev);
     }));
-    expect((failed.error as { code: string }).code).toBe("response_ended");
+    expect((failed.error as { code: string }).code).toBe("response_not_active");
     ws.close();
   });
 
@@ -159,7 +180,7 @@ describe("WebSocket surface", () => {
     const id = await first;
     ws.close();
     await sleep(60);
-    expect(agent.responses.get(id)!.response.status).toBe("cancelled");
+    expect(agent.retrieve(id).status).toBe("cancelled");
     expect(agent.status().state).toBe("idle");
   });
 });

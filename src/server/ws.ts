@@ -7,14 +7,13 @@
 import type { IncomingMessage } from "node:http";
 import type { Duplex } from "node:stream";
 import { WebSocketServer, type WebSocket } from "ws";
-import type { Agent } from "../profile/engine.js";
-import { ApiError } from "../profile/errors.js";
-import { parseCreateRequest } from "../profile/input.js";
+import type { CreateParams, ResponseSteerInput, ResponsesApi } from "../api/types.js";
+import { TERMINAL_EVENTS } from "../api/types.js";
+import { ApiError } from "../api/errors.js";
 import type { BearerAuth } from "./auth.js";
-import { TERMINAL_EVENTS } from "./sse.js";
 
 export interface WsOptions {
-  agent: Agent;
+  agent: ResponsesApi;
   auth: BearerAuth;
 }
 
@@ -90,13 +89,12 @@ export function createWebSocketHandler(opts: WsOptions): WebSocketHandler {
 
     async function onCreate(msg: Record<string, unknown>): Promise<void> {
       const { type: _t, event_id: _e, ...params } = msg;
-      const body = parseCreateRequest({ ...params, stream: true });
-      const record = await agent.create(body);
-      created.add(record.id);
-      const unsub = agent.subscribeChain(record.id, -1, (_rec, ev) => {
+      const response = await agent.create({ ...params, stream: true } as CreateParams);
+      created.add(response.id);
+      const unsub = agent.stream(response.id, -1, (ev) => {
         send(ev);
         if (TERMINAL_EVENTS.has(ev.type)) {
-          created.delete(record.id);
+          created.delete(response.id);
           queueMicrotask(() => {
             unsub();
             unsubs.delete(unsub);
@@ -110,16 +108,16 @@ export function createWebSocketHandler(opts: WsOptions): WebSocketHandler {
       if (msg.input === undefined) throw ApiError.invalid("Missing required parameter: 'input'.", "missing_required_parameter", "input");
       let previous = typeof msg.previous_response_id === "string" ? msg.previous_response_id : null;
       if (!previous) {
-        const turn = agent.status().turn as { response_id: string } | null;
+        const turn = agent.status().turn;
         if (!turn) {
-          send({ type: "response.steer.failed", event_id: msg.event_id ?? null, error: { type: "invalid_request_error", code: "response_ended", message: "No response is running; start a new turn." } });
+          send({ type: "response.steer.failed", event_id: msg.event_id ?? null, error: { type: "invalid_request_error", code: "response_not_active", message: "No response is running; start a new turn." } });
           return;
         }
         previous = turn.response_id;
       }
-      const { record, result, steerId } = await agent.steer(previous, msg.input);
-      if (!record || record.ended) {
-        send({ type: "response.steer.failed", event_id: msg.event_id ?? null, steer: { id: steerId, previous_response_id: previous }, error: { type: "invalid_request_error", code: "response_ended", message: "The response ended before the input could be taken in; start a new turn." } });
+      const { liveResponseId, result, steerId } = await agent.steer(previous, msg.input as ResponseSteerInput);
+      if (!liveResponseId) {
+        send({ type: "response.steer.failed", event_id: msg.event_id ?? null, steer: { id: steerId, previous_response_id: previous }, error: { type: "invalid_request_error", code: "response_not_active", message: "The response ended before the input could be taken in; start a new turn." } });
         return;
       }
       await result;

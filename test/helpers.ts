@@ -1,45 +1,54 @@
 import { promises as fs } from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
-import { Agent } from "../src/profile/engine.js";
-import { FakeHarness } from "../src/harness/fake.js";
-import { SessionStore } from "../src/session/store.js";
-import type { StreamEvent } from "../src/profile/types.js";
-import type { ResponseRecord } from "../src/profile/responses.js";
+import { AgentService, type ModelPolicy } from "../src/service/agent-service.js";
+import { FakeEngine } from "../src/engine/fake.js";
+import { defaultToolAttacher } from "../src/mcp/translate.js";
+import type { AgentResponse, StreamEvent } from "../src/api/types.js";
 
-export async function tmpAgent(opts: { midTurnInput?: boolean; wordDelayMs?: number } = {}) {
-  const root = await fs.mkdtemp(path.join(os.tmpdir(), "greyfolk-"));
-  const agentDir = path.join(root, "agent");
-  await fs.mkdir(agentDir);
-  let harness: FakeHarness | null = null;
-  const agent = new Agent({
-    harnessFactory: (sessionId) => {
-      harness = new FakeHarness({ agentDir, sessionId, midTurnInput: opts.midTurnInput, wordDelayMs: opts.wordDelayMs ?? 5 });
-      return harness;
+export async function tmpAgent(opts: { midTurnInput?: boolean; wordDelayMs?: number; modelPolicy?: ModelPolicy; agentDir?: string; root?: string } = {}) {
+  const root = opts.root ?? (await fs.mkdtemp(path.join(os.tmpdir(), "greyfolk-")));
+  const agentDir = opts.agentDir ?? path.join(root, "agent");
+  await fs.mkdir(agentDir, { recursive: true });
+  let engine: FakeEngine | null = null;
+  const agent = new AgentService({
+    createEngine: () => {
+      engine = new FakeEngine({ agentDir, midTurnInput: opts.midTurnInput, wordDelayMs: opts.wordDelayMs ?? 5 });
+      return engine;
     },
-    store: new SessionStore(agentDir),
-    modelPolicy: "fixed",
+    agentDir,
+    modelPolicy: opts.modelPolicy ?? "fixed",
     resetArchiveDir: path.join(root, "archive"),
+    attachTools: defaultToolAttacher(),
   });
   await agent.init();
-  return { agent, agentDir, root, harness: () => harness! };
+  return { agent, agentDir, root, engine: () => engine! };
 }
 
+/** A `POST /v1/responses` body. */
 export function req(input: unknown, extra: Record<string, unknown> = {}) {
-  return { model: null, input, instructions: null, previous_response_id: null, tools: [], stream: true, background: false, metadata: {}, deliver_held: [], ...extra };
+  return { input, stream: true, ...extra } as never;
 }
 
-export function collectChain(agent: Agent, id: string): Promise<{ events: StreamEvent[]; last: ResponseRecord }> {
+/** Collects the chain's events until a terminal event; `last` is the terminal response. */
+export function collectChain(agent: AgentService, id: string): Promise<{ events: StreamEvent[]; last: AgentResponse }> {
   return new Promise((resolve) => {
     const events: StreamEvent[] = [];
-    const unsub = agent.subscribeChain(id, -1, (rec, ev) => {
+    const unsub = agent.stream(id, -1, (ev) => {
       events.push(ev);
       if (ev.type === "response.completed" || ev.type === "response.failed" || ev.type === "response.cancelled") {
-        queueMicrotask(unsub);
-        resolve({ events, last: rec });
+        queueMicrotask(() => unsub());
+        resolve({ events, last: (ev as { response: AgentResponse }).response });
       }
     });
   });
+}
+
+export function textOf(r: AgentResponse): string {
+  const msg = r.output.find((o) => o.type === "message");
+  if (!msg || msg.type !== "message") return "";
+  const part = msg.content[0];
+  return part && part.type === "output_text" ? part.text : "";
 }
 
 export const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));

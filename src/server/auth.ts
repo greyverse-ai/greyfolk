@@ -3,11 +3,21 @@
  * The key is read from an inherited file descriptor (`--key-fd`), never from the environment,
  * arguments or a file the sandbox could read.
  */
-import { readFileSync } from "node:fs";
+import { closeSync, readFileSync } from "node:fs";
 import { timingSafeEqual } from "node:crypto";
 
+/** Reads the key once and closes the descriptor, so no engine process inherits it. */
 export function readKeyFromFd(fd: number): string {
-  const raw = readFileSync(fd, "utf8");
+  let raw: string;
+  try {
+    raw = readFileSync(fd, "utf8");
+  } finally {
+    try {
+      closeSync(fd);
+    } catch {
+      /* already closed */
+    }
+  }
   const key = raw.replace(/\r?\n$/, "");
   if (!key) throw new Error(`bearer key on fd ${fd} is empty`);
   return key;

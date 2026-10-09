@@ -2,6 +2,32 @@
 
 Spec: greyverse-project/specs/greyfolk.md (DRAFT 2, 2026-10-07). Nothing is committed; chunk 4 ended 2026-10-08.
 
+## Rework 2026-10-09 (complete) — the Responses API is the abstraction
+
+Baseline before the rework: commit `99e4ce8`. Audits: `~/.greyzone/projects/greyverse/loop/greyfolk-audit-*.md`.
+
+- **Two layers + engine strategies.** `server/` (controller: HTTP+SSE, WebSocket) → `service/agent-service.ts`
+  (the Responses API for one agent: turns, steer, cancel, held results, status; implements `ResponsesApi`)
+  → one `Engine` strategy per engine (`engine/claude.ts`, `engine/codex.ts`, `engine/fake.ts`). The engine
+  writes its output straight into the turn (`common/turn.ts`) with the official Responses types.
+- **No custom model.** `harness/types.ts` (engine event model) and `profile/types.ts` (hand-written Responses
+  look-alikes) are gone; `profile/engine.ts` (619 lines) is replaced by the service plus small parts in
+  `common/` (response log, session record, held results, steer queue, permission bridge). Types come from
+  npm `openai` 7.31 (`api/types.ts` adds only `greyfolk.*`).
+- **Engine registry.** `engine/registry.ts`; `engine/index.ts` lists the engines (one line each). A new engine =
+  one strategy file + one line (`test/registry.test.ts` proves it).
+- **Fixes from the audits.** `--no-host-tools` (Claude: built-ins `Agent`/`TodoWrite` only, host tools disallowed,
+  init tool list checked per turn; Codex: read-only sandbox + host features disabled, feature list checked at
+  start); `--harness`/`--harness-exec` removed (engine runs as greyfolk's child); MCP `headers` never echoed;
+  new input chosen by position (the same text twice works; `seen-inputs` hash store removed);
+  `require_approval` honoured (Claude asks unless `"never"`; Codex pre-approves and refuses `"always"`);
+  Codex MCP calls no longer blocked under `approval_policy=never` (`default_tools_approval_mode="approve"`);
+  subagent profile = a starter-owned JSON file with `mcp_tools`; official steer error code `response_not_active`;
+  `greyfolk.steer_taken_in` (was `response.steer.taken_in`); status `engine` (was `harness`); `engine_error`.
+- Tests: 59/59 green (`npm test`), `npm run typecheck` and `npm run build` green.
+- Still open: real-engine end-to-end (needs logins inside an agent folder), Codex app-server permissions
+  (§9.11), resume-from-copy per engine version (§3).
+
 ## Done (chunks 1–4)
 
 - `src/profile/*` — the OpenAI Responses profile: request validation (`input.ts`), error conventions

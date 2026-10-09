@@ -2,15 +2,22 @@ import { promises as fs } from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
 import { describe, expect, it } from "vitest";
-import { CodexHarness, buildArgs, mcpProfileToml, profileName, tomlValue } from "../src/harness/codex.js";
-import type { McpAttachment } from "../src/harness/types.js";
-import type { HarnessEvent } from "../src/harness/types.js";
+import { CodexEngine, HOST_FEATURES, NON_HOST_FEATURES, buildArgs, mcpProfileToml, profileName, redacted, tomlValue } from "../src/engine/codex.js";
+import { TOOL_KINDS } from "../src/options.js";
+import { AgentService } from "../src/service/agent-service.js";
+import { defaultToolAttacher } from "../src/mcp/translate.js";
+import { collectChain, req, sleep } from "./helpers.js";
 
-/** A stand-in `codex` binary: prints the argv it got, then a scripted JSONL event stream. */
+/** A stand-in `codex` binary: lists features, or prints the argv it got and a scripted JSONL event stream. */
 const FAKE_CODEX = `#!/usr/bin/env node
 const fs = require("node:fs");
-const prompt = fs.readFileSync(0, "utf8");
 const args = process.argv.slice(2);
+if (args[0] === "features") {
+  const known = (process.env.FAKE_CODEX_FEATURES || "").split(",").filter(Boolean);
+  process.stdout.write(known.map((f) => f.replace(/^!/, "") + "  stable  " + (f.startsWith("!") ? "false" : "true")).join("\\n") + "\\n");
+  process.exit(0);
+}
+const prompt = fs.readFileSync(0, "utf8");
 const dir = process.env.CODEX_HOME;
 const pi = args.indexOf("--profile");
 const profileFile = pi >= 0 ? dir + "/" + args[pi + 1] + ".config.toml" : null;
@@ -31,98 +38,127 @@ if (prompt.includes("[slow]")) {
 }
 `;
 
-async function setup(sessionId: string | null = null) {
+async function setup(opts: { noHostTools?: boolean; features?: string[] } = {}) {
+  const disabledTools = new Set(opts.noHostTools ? TOOL_KINDS : []);
   const root = await fs.mkdtemp(path.join(os.tmpdir(), "greyfolk-codex-"));
   const agentDir = path.join(root, "agent");
   await fs.mkdir(agentDir);
   const bin = path.join(root, "codex");
   await fs.writeFile(bin, FAKE_CODEX, { mode: 0o755 });
-  const ids: string[] = [];
-  const h = new CodexHarness({ agentDir, soul: "You are a test soul.", sessionId, harnessExec: [], model: null, subagentProfile: null, onSessionId: (id) => ids.push(id), codexPath: bin });
-  await h.prepare();
-  return { h, agentDir, ids };
+  const env = { FAKE_CODEX_FEATURES: (opts.features ?? [...HOST_FEATURES, ...NON_HOST_FEATURES]).join(",") };
+  const agent = new AgentService({
+    createEngine: () => new CodexEngine({ agentDir, soul: "You are a test soul.", disabledTools, exec: [], values: new Map(), subagentProfile: null, codexPath: bin, env }),
+    agentDir,
+    modelPolicy: "fixed",
+    resetArchiveDir: path.join(root, "archive"),
+    attachTools: defaultToolAttacher(),
+  });
+  return { agent, agentDir, root };
 }
 
-async function run(h: CodexHarness, text: string, mcp: McpAttachment[] = []): Promise<HarnessEvent[]> {
-  const out: HarnessEvent[] = [];
-  for await (const ev of h.startTurn({ responseId: "r1", input: [{ role: "user", text }], instructions: null, model: null, mcp, onPermissionRequest: async () => "deny" })) out.push(ev);
-  return out;
-}
+const argvOf = async (agentDir: string) => JSON.parse(await fs.readFile(path.join(agentDir, "argv.json"), "utf8")) as { args: string[]; prompt: string; home: string; profile: { text: string; mode: number } | null };
+const zone = (headers: Record<string, string> = {}) => [{ type: "mcp", server_label: "zone", server_url: "http://h/mcp", headers, require_approval: "never" }];
 
-describe("codex harness", () => {
-  it("encodes MCP attachments as a TOML config layer, never as argv", () => {
+describe("codex engine", () => {
+  it("encodes MCP attachments as a TOML config layer that approves its tools, never as argv", () => {
     expect(tomlValue({ a: "x", "b c": [1, true] })).toBe('{ a = "x", "b c" = [1, true] }');
     const toml = mcpProfileToml([
-      { kind: "http", label: "zone", url: "http://h/mcp", headers: { Authorization: "Bearer t" }, requireApproval: "never" },
-      { kind: "stdio", label: "br", command: "node", args: ["x.js"], env: { A: "1" }, requireApproval: "never" },
+      { kind: "http", label: "zone", url: "http://h/mcp", headers: { Authorization: "Bearer t" }, requireApproval: "never", allowedTools: ["file_read"] },
+      { kind: "stdio", label: "br", command: "node", args: ["x.js"], env: { A: "1" }, requireApproval: "never", allowedTools: null },
     ]);
-    expect(toml).toBe(['[mcp_servers.zone]', 'url = "http://h/mcp"', 'http_headers = { Authorization = "Bearer t" }', '', '[mcp_servers.br]', 'command = "node"', 'args = ["x.js"]', 'env = { A = "1" }', ''].join("\n"));
-    const args = buildArgs({ soulFile: "/a/.greyfolk/run/soul.md", agentDir: "/a", profile: profileName("resp_1/x"), model: "gpt-x", threadId: "t1", sandbox: "read-only" });
+    expect(toml).toBe(['[mcp_servers.zone]', 'url = "http://h/mcp"', 'http_headers = { Authorization = "Bearer t" }', 'default_tools_approval_mode = "approve"', 'enabled_tools = ["file_read"]', '', '[mcp_servers.br]', 'command = "node"', 'args = ["x.js"]', 'env = { A = "1" }', 'default_tools_approval_mode = "approve"', ''].join("\n"));
+    const args = buildArgs({ soulFile: "/a/.greyfolk/run/soul.md", agentDir: "/a", profile: profileName("resp_1/x"), model: "gpt-x", threadId: "t1", disabled: new Set() });
     expect(args.slice(0, 2)).toEqual(["exec", "--experimental-json"]);
-    expect(args).toContain("--skip-git-repo-check");
-    expect(args).toContain("--profile");
+    expect(args[args.indexOf("--sandbox") + 1]).toBe("workspace-write");
     expect(args[args.indexOf("--profile") + 1]).toBe("greyfolk-resp_1_x");
     expect(args.slice(-3)).toEqual(["resume", "t1", "-"]);
     expect(args).toContain('approval_policy="never"');
     expect(args.join(" ")).not.toContain("mcp_servers");
   });
 
-  it("hands MCP headers over in a private per-turn 0600 config layer that is deleted after the turn", async () => {
-    const { h, agentDir } = await setup();
-    const events = await run(h, "secret test", [{ kind: "http", label: "zone", url: "http://h/mcp", headers: { Authorization: "Bearer s3cret-token" }, requireApproval: "never" }]);
-    expect(events.at(-1)).toMatchObject({ type: "done", status: "completed" });
-    const argv = JSON.parse(await fs.readFile(path.join(agentDir, "argv.json"), "utf8")) as { args: string[]; profile: { text: string; mode: number } | null };
-    expect(argv.args.join(" ")).not.toContain("s3cret-token");
-    expect(argv.args.join(" ")).not.toContain("mcp_servers");
-    expect(argv.args).toContain("--profile");
-    expect(argv.profile).not.toBeNull();
-    expect(argv.profile!.text).toContain("[mcp_servers.zone]");
-    expect(argv.profile!.text).toContain('Authorization = "Bearer s3cret-token"');
-    expect(argv.profile!.mode).toBe(0o600);
-    const left = (await fs.readdir(agentDir)).filter((f) => f.endsWith(".config.toml"));
-    expect(left).toEqual([]);
+  it("with host tools off: read-only sandbox, every host feature disabled, web search off", () => {
+    const args = buildArgs({ soulFile: "/a/s.md", agentDir: "/a", profile: null, model: null, threadId: null, disabled: new Set(TOOL_KINDS) });
+    expect(args[args.indexOf("--sandbox") + 1]).toBe("read-only");
+    for (const f of HOST_FEATURES) expect(args.join(" ")).toContain(`--disable ${f}`);
+    expect(args).toContain('web_search="disabled"');
   });
 
-  it("runs a process per turn with CODEX_HOME = agent folder and maps the JSONL stream", async () => {
-    const { h, agentDir, ids } = await setup();
-    const events = await run(h, "hi", [{ kind: "http", label: "zone", url: "http://h/mcp", headers: {}, requireApproval: "never" }]);
-    const argv = JSON.parse(await fs.readFile(path.join(agentDir, "argv.json"), "utf8")) as { args: string[]; prompt: string; home: string; profile: { text: string } | null };
+  it("refuses to start with host tools off when this Codex does not know a feature it must disable (fail closed)", async () => {
+    const { agent } = await setup({ noHostTools: true, features: [...HOST_FEATURES.slice(1), ...NON_HOST_FEATURES] });
+    await expect(agent.init()).rejects.toThrow(/cannot confirm Codex host tools are off.*shell_tool/);
+    const ok = await setup({ noHostTools: true });
+    await ok.agent.init();
+  });
+
+  it("with host tools off, refuses a Codex that has an enabled feature not yet classified (allow-list)", async () => {
+    const { agent } = await setup({ noHostTools: true, features: [...HOST_FEATURES, ...NON_HOST_FEATURES, "new_shiny_tool", "!old_off_tool"] });
+    await expect(agent.init()).rejects.toThrow(/not yet classified.*new_shiny_tool/);
+  });
+
+  it("redacts and shortens engine stderr before it reaches an error message", () => {
+    expect(redacted("")).toBe("");
+    const r = redacted("error: Authorization: Bearer sk-live-123 at https://h/x?token=abc&y=1");
+    expect(r).not.toContain("sk-live-123");
+    expect(r).not.toContain("abc");
+    expect(redacted("x".repeat(2000)).length).toBeLessThan(420);
+  });
+
+  it("refuses require_approval 'always': codex exec cannot ask before a tool runs", async () => {
+    const { agent } = await setup();
+    await agent.init();
+    await expect(agent.create(req("hi", { tools: [{ ...zone()[0], require_approval: "always" }] }))).rejects.toMatchObject({ status: 400, code: "unsupported_tool", param: "tools[0].require_approval" });
+  });
+
+  it("hands MCP headers over in a private per-turn 0600 config layer that is deleted after the turn", async () => {
+    const { agent, agentDir } = await setup();
+    await agent.init();
+    const r = await agent.create(req("secret test", { tools: zone({ Authorization: "Bearer s3cret-token" }) }));
+    const { last, events } = await collectChain(agent, r.id);
+    expect(last.status).toBe("completed");
+    expect(JSON.stringify(events)).not.toContain("s3cret-token");
+    const argv = await argvOf(agentDir);
+    expect(argv.args.join(" ")).not.toContain("s3cret-token");
+    expect(argv.profile!.text).toContain('Authorization = "Bearer s3cret-token"');
+    expect(argv.profile!.mode).toBe(0o600);
+    expect((await fs.readdir(agentDir)).filter((f) => f.endsWith(".config.toml"))).toEqual([]);
+  });
+
+  it("runs a process per turn with CODEX_HOME = agent folder and writes the JSONL stream as Responses events", async () => {
+    const { agent, agentDir } = await setup();
+    await agent.init();
+    const r = await agent.create(req("hi", { tools: zone() }));
+    const { events, last } = await collectChain(agent, r.id);
+    const argv = await argvOf(agentDir);
     expect(argv.home).toBe(agentDir);
     expect(argv.prompt).toBe("hi");
-    expect(argv.args.join(" ")).not.toContain("mcp_servers");
-    expect(argv.profile!.text).toContain('url = "http://h/mcp"');
     expect(argv.args).toContain(`model_instructions_file=${JSON.stringify(path.join(agentDir, ".greyfolk", "run", "soul.md"))}`);
     expect(await fs.readFile(path.join(agentDir, ".greyfolk", "run", "soul.md"), "utf8")).toBe("You are a test soul.");
-    expect(ids).toEqual(["thread-1"]);
-    expect(h.sessionId()).toBe("thread-1");
-    expect(events.map((e) => e.type)).toEqual(["session", "tool_call", "tool_result", "text_delta", "message_done", "done"]);
-    const done = events.at(-1) as Extract<HarnessEvent, { type: "done" }>;
-    expect(done.status).toBe("completed");
-    expect(done.usage).toEqual({ input_tokens: 3, output_tokens: 4, total_tokens: 7 });
-    expect(h.status().state).toBe("idle");
-    // Second turn resumes the thread.
-    await run(h, "again");
-    const argv2 = JSON.parse(await fs.readFile(path.join(agentDir, "argv.json"), "utf8")) as { args: string[] };
-    expect(argv2.args.slice(-3)).toEqual(["resume", "thread-1", "-"]);
-    expect(ids).toEqual(["thread-1"]);
+    expect(agent.status().session_id).toBe("thread-1");
+    expect(await fs.readFile(path.join(agentDir, ".greyfolk", "session"), "utf8")).toBe("thread-1\n");
+    expect(events.map((e) => e.type)).toContain("response.mcp_call.completed");
+    expect(last.output.map((o) => o.type)).toEqual(["mcp_call", "message"]);
+    expect(last.usage).toMatchObject({ input_tokens: 3, output_tokens: 4, total_tokens: 7 });
+    const r2 = await agent.create(req("again"));
+    await collectChain(agent, r2.id);
+    expect((await argvOf(agentDir)).args.slice(-3)).toEqual(["resume", "thread-1", "-"]);
   });
 
   it("cancel kills the process and ends the turn cancelled; steer is refused", async () => {
-    const { h } = await setup();
-    const it = h.startTurn({ responseId: "r2", input: [{ role: "user", text: "[slow]" }], instructions: null, model: null, mcp: [], onPermissionRequest: async () => "deny" });
-    const events: HarnessEvent[] = [];
-    const consume = (async () => {
-      for await (const ev of it) events.push(ev);
-    })();
-    while (!events.some((e) => e.type === "tool_call")) await new Promise((r) => setTimeout(r, 10));
-    expect(await h.steer("s1", [{ role: "user", text: "x" }])).toBe("response_ended");
-    await h.cancel();
-    await consume;
-    expect(events.at(-1)).toMatchObject({ type: "done", status: "cancelled" });
+    const { agent } = await setup();
+    await agent.init();
+    const r = await agent.create(req("[slow]"));
+    const chain = collectChain(agent, r.id);
+    await sleep(300);
+    expect(await (await agent.steer(r.id, "x")).result).toBe("response_ended");
+    await agent.cancel(r.id);
+    expect((await chain).last.status).toBe("cancelled");
   });
 
   it("reads history back from the rollout file", async () => {
-    const { h, agentDir } = await setup("thread-9");
+    const { agent, agentDir } = await setup();
+    await fs.mkdir(path.join(agentDir, ".greyfolk"), { recursive: true });
+    await fs.writeFile(path.join(agentDir, ".greyfolk", "session"), "thread-9\n");
+    await agent.init();
     const dir = path.join(agentDir, "sessions", "2026", "10", "08");
     await fs.mkdir(dir, { recursive: true });
     const lines = [
@@ -132,7 +168,7 @@ describe("codex harness", () => {
       { timestamp: "t3", type: "response_item", payload: { type: "message", role: "assistant", content: [{ type: "output_text", text: "hi there" }] } },
     ];
     await fs.writeFile(path.join(dir, "rollout-2026-10-08T00-00-00-thread-9.jsonl"), lines.map((l) => JSON.stringify(l)).join("\n") + "\n");
-    expect(await h.history()).toEqual([
+    expect(await agent.history()).toEqual([
       { role: "user", text: "hello", at: "t2" },
       { role: "assistant", text: "hi there", at: "t3" },
     ]);

@@ -2,20 +2,20 @@
 import * as http from "node:http";
 import * as net from "node:net";
 import { promises as fs } from "node:fs";
-import type { Agent } from "../profile/engine.js";
+import type { ResponsesApi } from "../api/types.js";
 import type { BearerAuth } from "./auth.js";
 import { createRequestHandler } from "./http.js";
 import type { ListenTarget } from "./listen.js";
 import { createWebSocketHandler } from "./ws.js";
 
-export interface GreyfolkServer {
+export interface AgentServer {
   server: http.Server;
   /** Where the server listens (unix path or host:port). */
   address: string;
   close(): Promise<void>;
 }
 
-export function createServer(agent: Agent, auth: BearerAuth): { server: http.Server; closeSockets: () => void } {
+export function createServer(agent: ResponsesApi, auth: BearerAuth): { server: http.Server; closeSockets: () => void } {
   const server = http.createServer(createRequestHandler({ agent, auth }));
   const ws = createWebSocketHandler({ agent, auth });
   server.on("upgrade", ws.handleUpgrade);
@@ -78,7 +78,7 @@ export async function listen(server: http.Server, target: ListenTarget): Promise
   return target.kind === "fd" ? `fd:${target.fd}` : "";
 }
 
-export async function startServer(agent: Agent, auth: BearerAuth, target: ListenTarget): Promise<GreyfolkServer> {
+export async function startServer(agent: ResponsesApi, auth: BearerAuth, target: ListenTarget): Promise<AgentServer> {
   const { server, closeSockets } = createServer(agent, auth);
   const address = await listen(server, target);
   return {

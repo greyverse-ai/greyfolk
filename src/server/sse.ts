@@ -1,8 +1,8 @@
 /** Server-sent events writer for Responses streaming. */
 import type { ServerResponse } from "node:http";
-import type { StreamEvent } from "../profile/types.js";
+import type { StreamEvent } from "../api/types.js";
 
-export const TERMINAL_EVENTS = new Set(["response.completed", "response.failed", "response.cancelled"]);
+export { TERMINAL_EVENTS } from "../api/types.js";
 
 export class SseWriter {
   private readonly res: ServerResponse;
