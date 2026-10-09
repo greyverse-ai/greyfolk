@@ -2,7 +2,11 @@
  * `GET /health`: the agent's state in the common health check format for HTTP APIs
  * (`application/health+json`, draft-inadarei-api-health-check). Busy is not unhealthy.
  */
+import { createRequire } from "node:module";
 import type { AgentState } from "../api/types.js";
+
+/** This greyfolk's version: its package version, which is its GitHub release tag without the `v`. */
+export const VERSION = (createRequire(import.meta.url)("../../package.json") as { version: string }).version;
 
 export const HEALTH_CONTENT_TYPE = "application/health+json";
 
@@ -10,6 +14,8 @@ export function toHealth(s: AgentState) {
   const check = (observedValue: unknown, observedUnit?: string) => [{ componentType: "component", observedValue, ...(observedUnit ? { observedUnit } : {}), status: "pass" }];
   return {
     status: "pass",
+    version: VERSION.split(".")[0],
+    releaseId: VERSION,
     serviceId: "greyfolk",
     description: `one agent on the ${s.engine} engine`,
     checks: {

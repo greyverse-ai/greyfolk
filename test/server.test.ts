@@ -36,6 +36,7 @@ describe("HTTP controller", () => {
     expect(r.headers.get("content-type")).toContain("application/health+json");
     const h = (await r.json()) as { status: string; checks: Record<string, { observedValue: unknown }[]> };
     expect(h.status).toBe("pass");
+    expect((h as unknown as { releaseId: string }).releaseId).toMatch(/^\d+\.\d+\.\d+/);
     expect(h.checks["agent:busy"]![0]!.observedValue).toBe(false);
   });
 
