@@ -2,6 +2,7 @@ import { describe, expect, it } from "vitest";
 import { collectChain, req, sleep, textOf, tmpAgent } from "./helpers.js";
 import { ResponseLog } from "../src/service/response-log.js";
 import { Turn } from "../src/service/turn.js";
+import { applyPatchCall, customToolCall, shellCall, toolOutput, webSearchCall } from "../src/api/items.js";
 
 describe("service: the Responses API over one engine", () => {
   it("runs a turn, streams standard events and names the conversation (the engine's session)", async () => {
@@ -136,14 +137,16 @@ describe("service: the Responses API over one engine", () => {
 describe("turn: an engine's own tools are written as the standard item that means the same", () => {
   it("shell → shell_call(+output), file change → apply_patch_call(+output), web search → web_search_call, other → custom_tool_call(+output), MCP → mcp_call", () => {
     const turn = new Turn(new ResponseLog(), { instructions: null, model: "m", tools: [], background: false, metadata: {}, conversation: null });
-    turn.builtinStarted("c1", { kind: "shell", command: "ls" });
-    turn.builtinEnded("c1", { output: "a\nb", failed: false, exitCode: 0 });
-    turn.builtinStarted("c2", { kind: "apply_patch", path: "/x", diff: "d" });
-    turn.builtinEnded("c2", { output: "ok", failed: false });
-    turn.builtinStarted("c3", { kind: "web_search", query: "q" });
-    turn.builtinEnded("c3", { output: "", failed: false });
-    turn.builtinStarted("c4", { kind: "custom", name: "Agent", input: { prompt: "p" } });
-    turn.builtinEnded("c4", { output: "done", failed: false });
+    const calls = [
+      { id: "c1", item: shellCall("c1", "ls"), r: { output: "a\nb", failed: false, exitCode: 0 } },
+      { id: "c2", item: applyPatchCall("c2", "/x", "d"), r: { output: "ok", failed: false } },
+      { id: "c3", item: webSearchCall("q"), r: { output: "", failed: false } },
+      { id: "c4", item: customToolCall("c4", "Agent", { prompt: "p" }), r: { output: "done", failed: false } },
+    ];
+    for (const c of calls) {
+      turn.toolStarted(c.id, c.item);
+      turn.toolEnded(c.id, c.r.failed, toolOutput(c.item, c.id, c.r));
+    }
     turn.mcpCallStarted("c5", { server: "gz", name: "message_send", arguments: {} });
     turn.mcpCallEnded("c5", "sent", null);
     expect(turn.current.response.output.map((o) => o.type)).toEqual(["shell_call", "shell_call_output", "apply_patch_call", "apply_patch_call_output", "web_search_call", "custom_tool_call", "custom_tool_call_output", "mcp_call"]);

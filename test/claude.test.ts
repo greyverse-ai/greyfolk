@@ -125,10 +125,10 @@ describe("claude engine (Claude Agent SDK)", () => {
   });
 
   it("writes Claude Code's own tools as the standard item that means the same", () => {
-    expect(builtinCall("Bash", { command: "ls" })).toEqual({ kind: "shell", command: "ls" });
-    expect(builtinCall("Write", { file_path: "/a", content: "x" })).toMatchObject({ kind: "apply_patch", path: "/a", operation: "create_file" });
-    expect(builtinCall("WebSearch", { query: "q" })).toEqual({ kind: "web_search", query: "q" });
-    expect(builtinCall("Agent", { prompt: "p" })).toEqual({ kind: "custom", name: "Agent", input: { prompt: "p" } });
+    expect(builtinCall("t1", "Bash", { command: "ls" })).toMatchObject({ type: "shell_call", call_id: "t1", action: { commands: ["ls"] } });
+    expect(builtinCall("t2", "Write", { file_path: "/a", content: "x" })).toMatchObject({ type: "apply_patch_call", operation: { type: "create_file", path: "/a" } });
+    expect(builtinCall("t3", "WebSearch", { query: "q" })).toMatchObject({ type: "web_search_call", action: { type: "search", query: "q" } });
+    expect(builtinCall("t4", "Agent", { prompt: "p" })).toMatchObject({ type: "custom_tool_call", call_id: "t4", name: "Agent", input: JSON.stringify({ prompt: "p" }) });
   });
 
   it("an MCP tool runs only in a step that answers the turn", async () => {

@@ -23,7 +23,8 @@ import type { ChildProcess } from "node:child_process";
 import { getSessionMessages, query, type HookCallback, type McpServerConfig, type Options, type Query, type SDKMessage, type SDKUserMessage } from "@anthropic-ai/claude-agent-sdk";
 import type { InputMessage } from "../api/input.js";
 import type { McpAttachment } from "../mcp/translate.js";
-import { usage, type BuiltinCall, type Turn, type TurnEnd } from "../service/turn.js";
+import { applyPatchCall, customToolCall, shellCall, toolOutput, webSearchCall, type ToolCallItem } from "../api/items.js";
+import { usage, type Turn, type TurnEnd } from "../service/turn.js";
 import type { ConversationMessage, Engine, EngineOptions, EngineState, EngineTurn } from "./engine.js";
 import { checkExecPrefix, killGroup, spawnGroup } from "./process.js";
 import { foldInput, textOf } from "./prompt.js";
@@ -100,7 +101,7 @@ interface Active {
   cancelled: boolean;
   error: string | null;
   /** Tool calls of the turn: shown as MCP or as Claude Code's own, or not shown (refused or awaiting approval). */
-  calls: Map<string, "mcp" | "builtin" | "skip">;
+  calls: Map<string, "mcp" | "skip" | ToolCallItem>;
 }
 
 export function userMessage(text: string, uuid: string): SDKUserMessage {
@@ -121,16 +122,16 @@ export function splitMcpToolName(name: string): { label: string; tool: string } 
   return i < 0 ? null : { label: rest.slice(0, i), tool: rest.slice(i + 2) };
 }
 
-/** Claude Code's own tool as the standard item that means the same (Turn.builtinStarted). */
-export function builtinCall(name: string, input: unknown): BuiltinCall {
+/** Claude Code's own tool as the standard item that means the same. */
+export function builtinCall(id: string, name: string, input: unknown): ToolCallItem {
   const i = (input ?? {}) as Record<string, unknown>;
-  if ((name === "Bash" || name === "PowerShell") && typeof i.command === "string") return { kind: "shell", command: i.command };
+  if ((name === "Bash" || name === "PowerShell") && typeof i.command === "string") return shellCall(id, i.command);
   const file = i.file_path ?? i.notebook_path;
   if (["Write", "Edit", "MultiEdit", "NotebookEdit"].includes(name) && typeof file === "string") {
-    return { kind: "apply_patch", path: file, diff: patchOf(name, i), operation: name === "Write" ? "create_file" : "update_file" };
+    return applyPatchCall(id, file, patchOf(name, i), name === "Write" ? "create_file" : "update_file");
   }
-  if (name === "WebSearch" && typeof i.query === "string") return { kind: "web_search", query: i.query };
-  return { kind: "custom", name, input };
+  if (name === "WebSearch" && typeof i.query === "string") return webSearchCall(i.query);
+  return customToolCall(id, name, input);
 }
 
 const lines = (text: unknown, sign: "+" | "-"): string[] => (typeof text === "string" && text !== "" ? text.split("\n").map((l) => sign + l) : []);
@@ -321,7 +322,10 @@ export class ClaudeEngine implements Engine {
           const kind = a.calls.get(block.tool_use_id);
           a.calls.delete(block.tool_use_id);
           if (kind === "mcp") a.turn.mcpCallEnded(block.tool_use_id, out, block.is_error ? out : null);
-          else if (kind === "builtin") a.turn.builtinEnded(block.tool_use_id, { output: out, failed: !!block.is_error, exitCode: block.is_error ? Number(/^Exit code (\d+)/m.exec(out)?.[1] ?? 1) : 0 });
+          else if (typeof kind === "object") {
+            const failed = !!block.is_error;
+            a.turn.toolEnded(block.tool_use_id, failed, toolOutput(kind, block.tool_use_id, { output: out, failed, exitCode: failed ? Number(/^Exit code (\d+)/m.exec(out)?.[1] ?? 1) : 0 }));
+          }
         }
         return;
       }
@@ -333,8 +337,9 @@ export class ClaudeEngine implements Engine {
   private toolUse(a: Active, id: string, name: string, input: unknown): void {
     const mcp = splitMcpToolName(name);
     if (!mcp) {
-      a.turn.builtinStarted(id, builtinCall(name, input));
-      a.calls.set(id, "builtin");
+      const item = builtinCall(id, name, input);
+      a.turn.toolStarted(id, item);
+      a.calls.set(id, item);
       return;
     }
     const server = a.mcp.get(mcp.label);

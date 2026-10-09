@@ -5,23 +5,14 @@
  * an approval request is answered (the response ends with an `mcp_approval_request` item and the
  * caller's `mcp_approval_response` opens the next one) — both the standard's own shapes.
  */
-import type { ResponseApplyPatchToolCall, ResponseCustomToolCall, ResponseFunctionShellToolCall, ResponseFunctionWebSearch, ResponseOutputItem, ResponseOutputMessage, ResponseReasoningItem, ResponseUsage } from "../api/types.js";
+import type { ToolCallItem } from "../api/items.js";
+import type { ResponseOutputItem, ResponseOutputMessage, ResponseReasoningItem, ResponseUsage } from "../api/types.js";
 import { newId, newResponse, type ResponseLog, type ResponseRecord } from "./response-log.js";
 
 type McpCallItem = Extract<ResponseOutputItem, { type: "mcp_call" }>;
 
-/**
- * An engine's own (built-in) tool, written as the standard item that means the same: a shell
- * command → `shell_call`, a file change → `apply_patch_call`, a web search → `web_search_call`,
- * anything else (e.g. the subagent tool) → `custom_tool_call`. MCP is only for MCP servers.
- */
-export type BuiltinCall =
-  | { kind: "shell"; command: string }
-  | { kind: "apply_patch"; path: string; diff: string; operation?: "create_file" | "update_file" | "delete_file" }
-  | { kind: "web_search"; query: string }
-  | { kind: "custom"; name: string; input: unknown };
 type ApprovalItem = Extract<ResponseOutputItem, { type: "mcp_approval_request" }>;
-type ToolItem = McpCallItem | ResponseFunctionShellToolCall | ResponseApplyPatchToolCall | ResponseFunctionWebSearch | ResponseCustomToolCall;
+type ToolItem = McpCallItem | ToolCallItem;
 interface OpenCall {
   item: ToolItem;
   index: number;
@@ -29,14 +20,6 @@ interface OpenCall {
 interface Carried {
   callId: string;
   item: ToolItem;
-}
-
-/** How one of the engine's own tools ended. */
-export interface ToolResult {
-  output: string;
-  failed: boolean;
-  /** A shell command's exit code, when the engine reports it. */
-  exitCode?: number | null;
 }
 
 export interface TurnEnd {
@@ -140,40 +123,23 @@ export class Turn {
     this.current.emit({ type: "response.output_item.done", output_index: index, item: structuredClone(item) });
   }
 
-  /** One of the engine's own tools started (see `BuiltinCall`). */
-  builtinStarted(callId: string, call: BuiltinCall): void {
-    const id = newId("call");
-    const item: ToolItem =
-      call.kind === "shell"
-        ? { id, type: "shell_call", call_id: callId, action: { commands: [call.command], max_output_length: null, timeout_ms: null }, environment: null, status: "in_progress" }
-        : call.kind === "apply_patch"
-          ? { id, type: "apply_patch_call", call_id: callId, operation: call.operation === "delete_file" ? { type: "delete_file", path: call.path } : { type: call.operation ?? "update_file", path: call.path, diff: call.diff }, status: "in_progress" }
-          : call.kind === "web_search"
-            ? { id, type: "web_search_call", status: "in_progress", action: { type: "search", query: call.query } }
-            : { id, type: "custom_tool_call", call_id: callId, name: call.name, input: typeof call.input === "string" ? call.input : JSON.stringify(call.input ?? {}) };
+  /** One of the engine's own tools started, as the standard item the engine wrote (api/items). */
+  toolStarted(callId: string, item: ToolCallItem): void {
     this.startCall(callId, item);
   }
 
-  /** One of the engine's own tools ended; its result follows as the standard output item where one exists. */
-  builtinEnded(callId: string, result: ToolResult): void {
+  /** One of the engine's own tools ended; its standard output item, if it has one, follows it. */
+  toolEnded(callId: string, failed: boolean, output: ResponseOutputItem | null): void {
     const open = this.takeCall(callId);
     if (!open) return;
     const { item } = open;
-    if (item.type === "web_search_call") item.status = result.failed ? "failed" : "completed";
+    if (item.type === "web_search_call") item.status = failed ? "failed" : "completed";
     else if (item.type !== "custom_tool_call" && item.type !== "mcp_call") item.status = "completed";
     this.current.emit({ type: "response.output_item.done", output_index: open.index, item: structuredClone(item) });
-    const out: ResponseOutputItem | null =
-      item.type === "shell_call"
-        ? { id: newId("out"), type: "shell_call_output", call_id: callId, max_output_length: null, output: [{ stdout: result.output, stderr: "", outcome: { type: "exit", exit_code: result.exitCode ?? (result.failed ? 1 : 0) } }], status: "completed" }
-        : item.type === "apply_patch_call"
-          ? { id: newId("out"), type: "apply_patch_call_output", call_id: callId, status: result.failed ? "failed" : "completed", output: result.output }
-          : item.type === "custom_tool_call"
-            ? { id: newId("out"), type: "custom_tool_call_output", call_id: callId, output: result.output, status: "completed" }
-            : null;
-    if (!out) return;
-    const index = this.current.response.output.push(out) - 1;
-    this.current.emit({ type: "response.output_item.added", output_index: index, item: structuredClone(out) });
-    this.current.emit({ type: "response.output_item.done", output_index: index, item: structuredClone(out) });
+    if (!output) return;
+    const index = this.current.response.output.push(output) - 1;
+    this.current.emit({ type: "response.output_item.added", output_index: index, item: structuredClone(output) });
+    this.current.emit({ type: "response.output_item.done", output_index: index, item: structuredClone(output) });
   }
 
   /** A call to a tool of the request's MCP server `server`. */

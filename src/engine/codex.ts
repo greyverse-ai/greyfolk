@@ -21,7 +21,8 @@ import { promises as fs } from "node:fs";
 import type { InputMessage } from "../api/input.js";
 import type { ResponseUsage } from "../api/types.js";
 import type { McpAttachment } from "../mcp/translate.js";
-import { usage, type BuiltinCall, type Turn, type TurnEnd } from "../service/turn.js";
+import { applyPatchCall, customToolCall, shellCall, toolOutput, webSearchCall, type ToolCallItem } from "../api/items.js";
+import { usage, type Turn, type TurnEnd } from "../service/turn.js";
 import type { ThreadItem } from "./codex-protocol/v2/ThreadItem.js";
 import type { ThreadStartResponse } from "./codex-protocol/v2/ThreadStartResponse.js";
 import type { ThreadResumeResponse } from "./codex-protocol/v2/ThreadResumeResponse.js";
@@ -86,7 +87,7 @@ interface Active {
   /** Steers sent and not yet taken in: client message id → steer id. */
   steers: Map<string, string>;
   /** Tool calls: shown as MCP or as Codex's own, held until approved, or not shown. */
-  calls: Map<string, { kind: "mcp" | "builtin" | "skip" } | Held>;
+  calls: Map<string, { kind: "mcp" | "skip" } | { kind: "builtin"; item: ToolCallItem } | Held>;
   end: (e: TurnEnd) => void;
   /** Settles when the turn has ended. */
   done: Promise<void>;
@@ -271,7 +272,7 @@ export class CodexEngine implements Engine {
         return;
       }
       case "fileChange":
-        item.changes.forEach((c, i) => this.startBuiltin(a, `${item.id}#${i}`, { kind: "apply_patch", path: c.path, diff: c.diff, operation: c.kind.type === "add" ? "create_file" : c.kind.type === "delete" ? "delete_file" : "update_file" }));
+        item.changes.forEach((c, i) => this.startBuiltin(a, `${item.id}#${i}`, patchCall(`${item.id}#${i}`, c)));
         return;
       default: {
         const call = builtinOf(item);
@@ -300,12 +301,12 @@ export class CodexEngine implements Engine {
         return;
       }
       case "commandExecution":
-        if (!a.calls.has(item.id)) this.startBuiltin(a, item.id, { kind: "shell", command: item.command });
+        if (!a.calls.has(item.id)) this.startBuiltin(a, item.id, shellCall(item.id, item.command));
         return this.endBuiltin(a, item.id, { output: item.aggregatedOutput ?? "", failed: item.status !== "completed", exitCode: item.exitCode });
       case "fileChange":
         item.changes.forEach((c, i) => {
           const id = `${item.id}#${i}`;
-          if (!a.calls.has(id)) this.startBuiltin(a, id, { kind: "apply_patch", path: c.path, diff: c.diff, operation: c.kind.type === "add" ? "create_file" : c.kind.type === "delete" ? "delete_file" : "update_file" });
+          if (!a.calls.has(id)) this.startBuiltin(a, id, patchCall(id, c));
           this.endBuiltin(a, id, { output: item.status, failed: item.status !== "completed" });
         });
         return;
@@ -323,15 +324,15 @@ export class CodexEngine implements Engine {
     a.calls.set(id, { kind: "mcp" });
   }
 
-  private startBuiltin(a: Active, id: string, call: BuiltinCall): void {
-    a.turn.builtinStarted(id, call);
-    a.calls.set(id, { kind: "builtin" });
+  private startBuiltin(a: Active, id: string, item: ToolCallItem): void {
+    a.turn.toolStarted(id, item);
+    a.calls.set(id, { kind: "builtin", item });
   }
 
   private endBuiltin(a: Active, id: string, result: { output: string; failed: boolean; exitCode?: number | null }): void {
     const call = a.calls.get(id);
     a.calls.delete(id);
-    if (call?.kind === "builtin") a.turn.builtinEnded(id, result);
+    if (call?.kind === "builtin") a.turn.toolEnded(id, result.failed, toolOutput(call.item, id, result));
   }
 
   /** Requests the app-server sends: MCP tool approvals become the standard approval request. */
@@ -451,21 +452,26 @@ function turnUsage(a: Active): ResponseUsage | null {
 }
 
 /** Codex's own tools as the standard item that means the same (MCP and file changes aside). */
-function builtinOf(item: ThreadItem): BuiltinCall | null {
+function builtinOf(item: ThreadItem): ToolCallItem | null {
   switch (item.type) {
     case "commandExecution":
-      return { kind: "shell", command: item.command };
+      return shellCall(item.id, item.command);
     case "webSearch":
-      return { kind: "web_search", query: item.query };
+      return webSearchCall(item.query);
     case "collabAgentToolCall":
-      return { kind: "custom", name: item.tool, input: { prompt: item.prompt, model: item.model, receiver_thread_ids: item.receiverThreadIds } };
+      return customToolCall(item.id, item.tool, { prompt: item.prompt, model: item.model, receiver_thread_ids: item.receiverThreadIds });
     case "dynamicToolCall":
-      return { kind: "custom", name: item.namespace ? `${item.namespace}.${item.tool}` : item.tool, input: item.arguments };
+      return customToolCall(item.id, item.namespace ? `${item.namespace}.${item.tool}` : item.tool, item.arguments);
     case "imageView":
-      return { kind: "custom", name: "view_image", input: { path: item.path } };
+      return customToolCall(item.id, "view_image", { path: item.path });
     default:
       return null;
   }
+}
+
+/** A Codex file change as the standard `apply_patch_call`. */
+function patchCall(id: string, c: { path: string; diff: string; kind: { type: string } }): ToolCallItem {
+  return applyPatchCall(id, c.path, c.diff, c.kind.type === "add" ? "create_file" : c.kind.type === "delete" ? "delete_file" : "update_file");
 }
 
 function resultOf(item: ThreadItem): { output: string; failed: boolean } {
