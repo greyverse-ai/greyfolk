@@ -1,7 +1,7 @@
 /**
  * Every start option greyfolk takes, defined once (spec §8). The table below is the only place an
- * option is declared: argv parsing, validation and `--help` all come from it. Engines add their own
- * options through the registry (`EngineDefinition.options`), so a new engine never edits this file.
+ * option is declared: argv parsing, validation and `--help` all come from it. An engine's own
+ * options are its own keys, after `--`.
  *
  * Each option has exactly one source: the start command of this greyfolk process, set by its
  * starter. Everything after `--` belongs to the engine: greyfolk hands it to the engine's SDK as
@@ -29,7 +29,7 @@ export const CORE_OPTIONS: OptionSpec[] = [
   { name: "engine", kind: "string", help: "the engine to run (required; see the list below)" },
   { name: "engine-exec", kind: "string", help: "a launcher prefix the engine is started through (e.g. a sandbox wrapper); without it greyfolk starts the engine itself" },
   { name: "model", kind: "string", values: ["fixed", "request"], default: "fixed", help: "fixed: a request's model is ignored; request: it may choose within the engine's family" },
-  { name: "soul", kind: "string", help: "the instruction file to use instead of AGENTS.md / CLAUDE.md in the agent folder" },
+  { name: "soul", kind: "string", help: "an instruction file added to the engine's own (the engine reads AGENTS.md / CLAUDE.md in the agent folder itself)" },
   { name: "help", kind: "flag", default: false, help: "print this list" },
   { name: "disable-tools", kind: "list", removed: "--disable-tools was removed: pass the engine's own options after --" },
   { name: "no-host-tools", kind: "flag", removed: "--no-host-tools was removed: pass the engine's own options after -- (e.g. Claude Code's --tools)" },

@@ -5,7 +5,8 @@
  *   the session, compaction, native subagents and their late results stay Claude Code's own.
  *   The process runs in its own process group (through `--engine-exec` when given).
  * - The agent folder is Claude Code's config home (`cwd` = `CLAUDE_CONFIG_DIR`): its own settings
- *   files there are read as usual (setting source `user`); the soul is the system prompt.
+ *   files and its CLAUDE.md (the soul) there are read by Claude Code as usual (setting source `user`),
+ *   under Claude Code's own system prompt; `--soul FILE` is appended to that prompt.
  * - The engine's own options (after `--`) go to Claude Code's command line as they are (SDK
  *   `extraArgs`), e.g. `--tools Agent,TodoWrite`.
  * - A turn's MCP servers go over the SDK's control channel (`setMcpServers`), never argv.
@@ -108,7 +109,7 @@ export function userMessage(text: string, uuid: string): SDKUserMessage {
 
 export function toMcpServers(mcp: McpAttachment[]): Record<string, McpServerConfig> {
   const out: Record<string, McpServerConfig> = {};
-  for (const m of mcp) out[m.label] = m.kind === "http" ? { type: "http", url: m.url, headers: m.headers } : { type: "stdio", command: m.command, args: m.args, env: m.env };
+  for (const m of mcp) out[m.label] = { type: "http", url: m.url, headers: m.headers };
   return out;
 }
 
@@ -171,7 +172,6 @@ export class ClaudeEngine implements Engine {
   async start(): Promise<void> {
     const st = await fs.stat(this.opts.agentDir).catch(() => null);
     if (!st?.isDirectory()) throw new Error(`agent folder not found: ${this.opts.agentDir}`);
-    if (!this.opts.soul.trim()) throw new Error("the soul (agent instruction file) is empty");
     checkExecPrefix(this.opts.exec);
     // The SDK's session readers find this agent's sessions through the same config home.
     process.env.CLAUDE_CONFIG_DIR = this.opts.agentDir;
@@ -205,7 +205,8 @@ export class ClaudeEngine implements Engine {
       cwd: this.opts.agentDir,
       env: { ...process.env, ...this.opts.env, CLAUDE_CONFIG_DIR: this.opts.agentDir, DISABLE_AUTOUPDATER: "1" },
       abortController: proc.abort,
-      systemPrompt: this.opts.soul,
+      // Claude Code's own system prompt; the agent's CLAUDE.md in its config home is read by Claude Code itself.
+      systemPrompt: { type: "preset", preset: "claude_code", ...(this.opts.extraInstructions ? { append: this.opts.extraInstructions } : {}) },
       settingSources: ["user"],
       extraArgs: this.extraArgs,
       permissionMode: "default",
@@ -414,9 +415,16 @@ export class ClaudeEngine implements Engine {
       if (this.active === a) this.kill(proc);
       return;
     }
-    // Steers Claude Code still holds would run on their own after the interrupt: each is stopped as it starts.
-    const queued = receipt ? receipt.still_queued : [...a.steers.keys()];
-    for (const u of queued) if (a.steers.has(u)) this.stopWhenStarted.add(u);
+    // Messages of the turn Claude Code still holds (its input, steers) would run on their own after the
+    // interrupt: each is taken back out of Claude Code's queue (its own `cancel_async_message`), and one
+    // that cannot be is stopped as it starts. Claude Code's own queued work (task notifications) stays.
+    const queued = receipt ? receipt.still_queued : [...a.uuids];
+    const recall = (proc.query as unknown as { cancelAsyncMessage?: (uuid: string) => Promise<boolean> }).cancelAsyncMessage;
+    for (const u of queued) {
+      if (!a.uuids.has(u)) continue;
+      const taken = recall ? await recall.call(proc.query, u).catch(() => false) : false;
+      if (!taken) this.stopWhenStarted.add(u);
+    }
     // An interrupt before the turn's step started leaves no result to end it.
     if (!a.mine && this.active === a) this.finish(a, { status: "cancelled", error: null, usage: null });
   }
@@ -447,4 +455,4 @@ export class ClaudeEngine implements Engine {
   }
 }
 
-registerEngine({ name: "claude", needsSoul: true, create: (o) => new ClaudeEngine(o) });
+registerEngine({ name: "claude", create: (o) => new ClaudeEngine(o) });

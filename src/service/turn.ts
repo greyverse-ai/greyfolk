@@ -55,8 +55,14 @@ export interface TurnSettings {
 }
 
 /** Usage in the SDK shape from plain token counts. */
-export function usage(input: number, output: number): ResponseUsage {
-  return { input_tokens: input, input_tokens_details: { cached_tokens: 0, cache_write_tokens: 0 }, output_tokens: output, output_tokens_details: { reasoning_tokens: 0 }, total_tokens: input + output };
+export function usage(input: number, output: number, detail: { cached?: number; cacheWrite?: number; reasoning?: number; total?: number } = {}): ResponseUsage {
+  return {
+    input_tokens: input,
+    input_tokens_details: { cached_tokens: detail.cached ?? 0, cache_write_tokens: detail.cacheWrite ?? 0 },
+    output_tokens: output,
+    output_tokens_details: { reasoning_tokens: detail.reasoning ?? 0 },
+    total_tokens: detail.total ?? input + output,
+  };
 }
 
 export class Turn {
@@ -74,7 +80,8 @@ export class Turn {
   private carried: Carried[] = [];
   /** Approval requests asked after the response that asks had already ended: they open the next one. */
   private laterApprovals: ApprovalItem[] = [];
-  private stopping = false;
+  /** Approval requests on the live response that is about to stop for them (the stop runs on the next tick). */
+  private stopping: ApprovalItem[] = [];
 
   constructor(
     private readonly log: ResponseLog,
@@ -251,12 +258,13 @@ export class Turn {
     const index = this.current.response.output.push(item) - 1;
     this.current.emit({ type: "response.output_item.added", output_index: index, item: structuredClone(item) });
     this.current.emit({ type: "response.output_item.done", output_index: index, item: structuredClone(item) });
-    if (this.stopping) return;
+    this.stopping.push(item);
+    if (this.stopping.length > 1) return;
     // Approvals asked in the same moment (parallel tool calls) end one response together.
-    this.stopping = true;
+    const rec = this.current;
     setImmediate(() => {
-      this.stopping = false;
-      if (this.current.ended) return;
+      this.stopping = [];
+      if (this.current !== rec || rec.ended) return;
       this.carried = this.suspendCalls();
       this.finishCurrent("completed");
     });
@@ -276,6 +284,11 @@ export class Turn {
 
   /** The model step took a steer in: the running response ends `incomplete` (steered) and a successor continues the turn. */
   steerTakenIn(steerId: string): void {
+    const settle = this.steers.get(steerId);
+    this.steers.delete(steerId);
+    // The response is stopping for approval: that boundary wins (as in the standard, the steer goes on
+    // in the response that answers the approval), so this one is not split.
+    if (this.stopping.length > 0 || this.current.ended) return settle?.("taken_in");
     const prev = this.current;
     this.closeMessage("incomplete");
     this.carried = this.suspendCalls();
@@ -283,8 +296,6 @@ export class Turn {
     prev.response.incomplete_details = { reason: "steered" };
     prev.response.completed_at = Math.floor(Date.now() / 1000);
     this.successor(() => prev.emit({ type: "response.incomplete", response: prev.snapshot() }));
-    const settle = this.steers.get(steerId);
-    this.steers.delete(steerId);
     settle?.("taken_in");
   }
 

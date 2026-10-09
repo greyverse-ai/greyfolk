@@ -132,4 +132,4 @@ export class FakeEngine implements Engine {
   }
 }
 
-registerEngine({ name: "fake", needsSoul: false, create: () => new FakeEngine() });
+registerEngine({ name: "fake", create: () => new FakeEngine() });

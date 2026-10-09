@@ -7,9 +7,9 @@ import { AgentService } from "../src/service/agent.js";
 import { defaultToolAttacher } from "../src/mcp/translate.js";
 import { collectChain, req, textOf } from "./helpers.js";
 
-async function mk(engineArgs: string[] = []) {
+async function mk(engineArgs: string[] = [], extraInstructions: string | null = null) {
   const agentDir = await fs.mkdtemp(path.join(os.tmpdir(), "greyfolk-claude-"));
-  const e = new ClaudeEngine({ agentDir, soul: "You are the soul.", engineArgs, exec: [], values: new Map(), queryFn: () => { throw new Error("not started"); } });
+  const e = new ClaudeEngine({ agentDir, extraInstructions, engineArgs, exec: [], values: new Map(), queryFn: () => { throw new Error("not started"); } });
   await e.start();
   return { agentDir, e };
 }
@@ -20,7 +20,7 @@ const callHook = (e: ClaudeEngine, tool_name: string) => (e.preToolUse as unknow
 function activate(e: ClaudeEngine, mcp: { label: string; requireApproval: "never" | "always"; allowedTools: string[] | null }[], asked: string[]) {
   (e as unknown as { active: unknown }).active = {
     turn: { requestApproval: async ({ name }: { name: string }) => (asked.push(name), false) },
-    mcp: new Map(mcp.map((m) => [m.label, { kind: "http", url: "http://h", headers: {}, ...m }])),
+    mcp: new Map(mcp.map((m) => [m.label, { url: "http://h", headers: {}, ...m }])),
     steers: new Map(), calls: new Map(), end: () => {}, cancelled: false, error: null, mine: true, uuids: new Set(), proc: null,
   };
 }
@@ -49,9 +49,15 @@ class FakeQuery {
     return { added: [], removed: [], errors: {} };
   }
   async setModel() {}
+  queued: string[] = [];
+  recalled: string[] = [];
   async interrupt() {
     this.interrupts++;
-    return { still_queued: [] };
+    return { still_queued: this.queued };
+  }
+  async cancelAsyncMessage(uuid: string) {
+    this.recalled.push(uuid);
+    return true;
   }
   async *[Symbol.asyncIterator]() {
     for (;;) {
@@ -75,7 +81,7 @@ async function scripted() {
     queries.push(q);
     return q;
   }) as never;
-  const e = new ClaudeEngine({ agentDir, soul: "soul", engineArgs: [], exec: [], values: new Map(), queryFn });
+  const e = new ClaudeEngine({ agentDir, extraInstructions: null, engineArgs: [], exec: [], values: new Map(), queryFn });
   await e.start();
   const agent = new AgentService({ engine: e, modelPolicy: "fixed", attachTools: defaultToolAttacher() });
   return { agent, queries };
@@ -86,13 +92,14 @@ const result = (uuids: string[]) => ({ type: "result", subtype: "success", is_er
 const init = (session: string) => ({ type: "system", subtype: "init", session_id: session, model: "claude-x" });
 
 describe("claude engine (Claude Agent SDK)", () => {
-  it("uses the agent folder as Claude Code's home and its settings as they are; the soul is the system prompt", async () => {
+  it("uses the agent folder as Claude Code's home, its settings and CLAUDE.md as they are, under Claude Code's own system prompt", async () => {
     const { agentDir, e } = await mk();
     const o = e.buildOptions(proc(), null);
     expect(o.cwd).toBe(agentDir);
     expect(o.env?.CLAUDE_CONFIG_DIR).toBe(agentDir);
     expect(o.settingSources).toEqual(["user"]);
-    expect(o.systemPrompt).toBe("You are the soul.");
+    expect(o.systemPrompt).toEqual({ type: "preset", preset: "claude_code" });
+    expect((await mk([], "Added.")).e.buildOptions(proc(), null).systemPrompt).toEqual({ type: "preset", preset: "claude_code", append: "Added." });
     expect(o.mcpServers).toBeUndefined(); // a turn's servers go over the control channel
     expect(o.tools).toBeUndefined(); // greyfolk sets no tools of its own
     expect(e.buildOptions(proc(), "sess-1").resume).toBe("sess-1");
@@ -174,5 +181,20 @@ describe("claude engine (Claude Agent SDK)", () => {
     expect(r2.conversation?.id).toBe("s1");
     expect(queries.length).toBe(1);
   });
-});
 
+  it("cancel takes the turn's still-queued message back out of Claude Code (its own steps stay)", async () => {
+    const { agent, queries } = await scripted();
+    const r = await agent.create(req("one"));
+    const c = collectChain(agent, r.id);
+    await tick();
+    const q = queries[0]!;
+    q.push(init("s1"));
+    q.push(textMsg("late subagent news", "own-uuid")); // Claude Code is busy with a step of its own
+    await tick();
+    q.queued = [q.sent[0]!.uuid];
+    await agent.cancel(r.id);
+    expect((await c).last.status).toBe("cancelled");
+    expect(q.recalled).toEqual([q.sent[0]!.uuid]);
+    expect(q.interrupts).toBe(1);
+  });
+});

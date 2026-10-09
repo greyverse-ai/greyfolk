@@ -137,15 +137,31 @@ describe("turn: an engine's own tools are written as the standard item that mean
   it("shell → shell_call(+output), file change → apply_patch_call(+output), web search → web_search_call, other → custom_tool_call(+output), MCP → mcp_call", () => {
     const turn = new Turn(new ResponseLog(), { instructions: null, model: "m", tools: [], background: false, metadata: {}, conversation: null });
     turn.builtinStarted("c1", { kind: "shell", command: "ls" });
-    turn.builtinEnded("c1", "a\nb", null);
+    turn.builtinEnded("c1", { output: "a\nb", failed: false, exitCode: 0 });
     turn.builtinStarted("c2", { kind: "apply_patch", path: "/x", diff: "d" });
-    turn.builtinEnded("c2", "ok", null);
+    turn.builtinEnded("c2", { output: "ok", failed: false });
     turn.builtinStarted("c3", { kind: "web_search", query: "q" });
-    turn.builtinEnded("c3", "", null);
+    turn.builtinEnded("c3", { output: "", failed: false });
     turn.builtinStarted("c4", { kind: "custom", name: "Agent", input: { prompt: "p" } });
-    turn.builtinEnded("c4", "done", null);
+    turn.builtinEnded("c4", { output: "done", failed: false });
     turn.mcpCallStarted("c5", { server: "gz", name: "message_send", arguments: {} });
     turn.mcpCallEnded("c5", "sent", null);
     expect(turn.current.response.output.map((o) => o.type)).toEqual(["shell_call", "shell_call_output", "apply_patch_call", "apply_patch_call_output", "web_search_call", "custom_tool_call", "custom_tool_call_output", "mcp_call"]);
+    expect(turn.current.response.output[6]).toMatchObject({ type: "custom_tool_call_output", status: "completed" });
+  });
+
+  it("an approval and a steer at the same moment: the approval boundary wins, nothing is shown twice", async () => {
+    const turn = new Turn(new ResponseLog(), { instructions: null, model: "m", tools: [], background: false, metadata: {}, conversation: null });
+    turn.open();
+    const first = turn.current;
+    let taken = "";
+    turn.steers.set("s1", (r) => (taken = r));
+    void turn.requestApproval({ server: "ext", name: "send", arguments: {} });
+    turn.steerTakenIn("s1");
+    await new Promise((r) => setImmediate(r));
+    expect(taken).toBe("taken_in");
+    expect(first.response.status).toBe("completed");
+    expect(first.response.output.map((o) => o.type)).toEqual(["mcp_approval_request"]);
+    expect(first.nextResponseId).toBeNull();
   });
 });

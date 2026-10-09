@@ -4,14 +4,9 @@
  * strategy file plus one line there.
  */
 import type { Engine, EngineOptions } from "./engine.js";
-import type { OptionSpec } from "../options.js";
 
 export interface EngineDefinition {
   name: string;
-  /** False only for engines that run no model (the fake). */
-  needsSoul: boolean;
-  /** The engine's own start options, named `<engine>-<option>`; merged into the one option table. */
-  options?: OptionSpec[];
   create(opts: EngineOptions): Engine;
 }
 
@@ -30,9 +25,4 @@ export function getEngine(name: string): EngineDefinition {
 
 export function engineNames(): string[] {
   return [...engines.keys()];
-}
-
-/** The engines' own options, for the one option table. */
-export function engineOptions(): OptionSpec[] {
-  return [...engines.values()].flatMap((d) => d.options ?? []);
 }

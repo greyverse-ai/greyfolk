@@ -1,225 +1,482 @@
 /**
- * Codex engine: the Codex SDK (`@openai/codex-sdk`) behind the Responses protocol.
+ * Codex engine: Codex's own long-running interface, `codex app-server`, behind the Responses
+ * protocol (intent: one engine process kept across turns, never one per request).
  *
- * - The SDK runs `codex exec` per turn and resumes the thread (= the conversation) by id; the
- *   session, compaction and Codex's own subagents stay Codex's.
- * - The agent folder is Codex's home (`CODEX_HOME` = working folder): its own `config.toml` there
- *   is read as usual; the soul is the model instructions file.
- * - The engine's own options (after `--`) use codex's own CLI keys, as far as the Codex SDK can
- *   carry them (`parseCodexArgs`); anything else is refused at start.
- * - A turn's MCP servers are SDK config; their credentials travel only in the process
- *   environment (`env_http_headers`, `env_vars`), never in argv or a file.
- * - `codex exec` cannot ask before a tool runs: MCP tools are pre-approved and the service
- *   refuses `require_approval: "always"`. `allowed_tools` = Codex `enabled_tools`.
+ * - One app-server process for the agent, started with the engine's own options (after `--`) as
+ *   they are, e.g. `-c sandbox_mode="workspace-write"`, `--enable F`. The agent folder is Codex's
+ *   home (`CODEX_HOME`) and working folder: its own `config.toml` and AGENTS.md (the soul) there are
+ *   read by Codex as usual, under Codex's own base instructions; `--soul FILE` is added to them.
+ * - A conversation is a Codex thread; the session, compaction and Codex's own subagents stay
+ *   Codex's. Turns, steer (`turn/steer`) and cancel (`turn/interrupt`) are calls into the process.
+ * - A turn's MCP servers are the thread's config, sent over the process's stdin (never argv, the
+ *   environment or a file; Codex keeps them off disk). When a turn names other servers or
+ *   credentials, the thread is unloaded and loaded again with them: the process stays.
+ * - `require_approval` maps to the server's own approval mode; Codex then asks through an MCP
+ *   elicitation, which becomes the standard `mcp_approval_request`. Whether Codex may ask at all
+ *   is the agent's own approval policy. Codex's own approval prompts (commands, file changes)
+ *   have no standard shape and nobody to ask, so they are declined.
  */
+import { randomUUID } from "node:crypto";
 import { promises as fs } from "node:fs";
-import * as path from "node:path";
-import { Codex, type ThreadEvent, type ThreadItem } from "@openai/codex-sdk";
+import type { InputMessage } from "../api/input.js";
+import type { ResponseUsage } from "../api/types.js";
 import type { McpAttachment } from "../mcp/translate.js";
-import { usage, type Turn, type TurnEnd } from "../service/turn.js";
+import { usage, type BuiltinCall, type Turn, type TurnEnd } from "../service/turn.js";
+import type { ThreadItem } from "./codex-protocol/v2/ThreadItem.js";
+import type { ThreadStartResponse } from "./codex-protocol/v2/ThreadStartResponse.js";
+import type { ThreadResumeResponse } from "./codex-protocol/v2/ThreadResumeResponse.js";
+import type { TurnStartResponse } from "./codex-protocol/v2/TurnStartResponse.js";
+import type { ThreadItemsListResponse } from "./codex-protocol/v2/ThreadItemsListResponse.js";
+import type { ServerNotification } from "./codex-protocol/ServerNotification.js";
+import type { McpServerElicitationRequestParams } from "./codex-protocol/v2/McpServerElicitationRequestParams.js";
+import type { McpServerElicitationRequestResponse } from "./codex-protocol/v2/McpServerElicitationRequestResponse.js";
+import type { TokenUsageBreakdown } from "./codex-protocol/v2/TokenUsageBreakdown.js";
+import { codexBinary } from "./codex-binary.js";
+import { AppServerRpc, RpcError } from "./codex-rpc.js";
 import type { ConversationMessage, Engine, EngineOptions, EngineState, EngineTurn } from "./engine.js";
+import { checkExecPrefix, killGroup, spawnGroup } from "./process.js";
 import { foldInput } from "./prompt.js";
 import { registerEngine } from "./registry.js";
 
-/** Pinned SDK (resume-from-copy is tested per version, spec §3). */
-export const CODEX_SDK_VERSION = "0.161.0";
+type Notification<M extends ServerNotification["method"]> = Extract<ServerNotification, { method: M }>["params"];
 
-/**
- * The engine's own options, with codex's own CLI keys, as far as the Codex SDK can carry them:
- * `--sandbox/-s`, `--model/-m`, `--add-dir` (SDK thread options), `-c/--config key=value`,
- * `--enable F`, `--disable F` (config overrides). Anything else is refused.
- */
-export interface CodexArgs {
-  thread: { sandboxMode?: "read-only" | "workspace-write" | "danger-full-access"; model?: string; additionalDirectories?: string[] };
-  config: string[];
+/** app-server options greyfolk owns: it talks to the process over stdio. */
+const TRANSPORT_FLAGS = /^--(listen|stdio|ws-[a-z-]+)(=|$)/;
+
+export function checkCodexArgs(args: string[]): void {
+  for (const a of args) if (TRANSPORT_FLAGS.test(a)) throw new Error(`codex engine option ${a.split("=")[0]} is greyfolk's own (it talks to codex app-server over stdio)`);
 }
 
-export function parseCodexArgs(args: string[]): CodexArgs {
-  const out: CodexArgs = { thread: {}, config: [] };
-  for (let i = 0; i < args.length; i++) {
-    const a = args[i]!;
-    const eq = a.startsWith("--") ? a.indexOf("=") : -1;
-    const flag = eq > 0 ? a.slice(0, eq) : a;
-    const value = eq > 0 ? a.slice(eq + 1) : args[++i];
-    if (value === undefined) throw new Error(`codex engine option ${flag} needs a value`);
-    if (flag === "-c" || flag === "--config") out.config.push(value);
-    else if (flag === "--enable") out.config.push(`features.${value}=true`);
-    else if (flag === "--disable") out.config.push(`features.${value}=false`);
-    else if (flag === "-s" || flag === "--sandbox") {
-      if (value !== "read-only" && value !== "workspace-write" && value !== "danger-full-access") throw new Error(`codex engine option --sandbox: '${value}' is not a sandbox mode`);
-      out.thread.sandboxMode = value;
-    } else if (flag === "-m" || flag === "--model") out.thread.model = value;
-    else if (flag === "--add-dir") (out.thread.additionalDirectories ??= []).push(value);
-    else throw new Error(`codex engine option '${flag}' cannot be passed through the Codex SDK (it takes --sandbox, --model, --add-dir, -c/--config, --enable, --disable)`);
+/** A turn's MCP servers as Codex thread config (`mcp_servers`), credentials included. */
+export function mcpConfig(mcp: McpAttachment[]): Record<string, unknown> {
+  const servers: Record<string, unknown> = {};
+  for (const m of mcp) {
+    const entry: Record<string, unknown> = { url: m.url, http_headers: m.headers };
+    entry.default_tools_approval_mode = m.requireApproval === "always" ? "prompt" : "approve";
+    if (m.allowedTools) entry.enabled_tools = m.allowedTools;
+    servers[m.label] = entry;
   }
-  return out;
+  return { mcp_servers: servers };
 }
-
-export const SOUL_FILE = path.join(".greyfolk", "soul.md");
 
 export interface CodexEngineOptions extends EngineOptions {
+  /** The codex binary (default: the pinned `@openai/codex` package's). */
   codexPath?: string;
   env?: Record<string, string>;
 }
 
-/** A turn's MCP servers as SDK config, with every credential moved into named environment variables. */
-export function mcpConfig(mcp: McpAttachment[]): { config: Record<string, unknown>; env: Record<string, string> } {
-  const config: Record<string, unknown> = {};
-  const env: Record<string, string> = {};
-  mcp.forEach((m, i) => {
-    const prefix = `GREYFOLK_MCP_${i}`;
-    const entry: Record<string, unknown> = { default_tools_approval_mode: "approve" };
-    if (m.allowedTools) entry.enabled_tools = m.allowedTools;
-    if (m.kind === "http") {
-      entry.url = m.url;
-      const names: Record<string, string> = {};
-      Object.entries(m.headers).forEach(([h, v], j) => {
-        names[h] = `${prefix}_H${j}`;
-        env[`${prefix}_H${j}`] = v;
-      });
-      if (Object.keys(names).length) entry.env_http_headers = names;
-    } else {
-      const { GREYFOLK_MCP_HEADERS: headers, ...plain } = m.env;
-      entry.command = m.command;
-      entry.args = m.args;
-      entry.env = { ...plain, ...(headers ? { GREYFOLK_MCP_HEADERS_VAR: `${prefix}_HDR` } : {}) };
-      if (headers) {
-        env[`${prefix}_HDR`] = headers;
-        entry.env_vars = [`${prefix}_HDR`];
-      }
-    }
-    config[m.label] = entry;
-  });
-  return { config: Object.keys(config).length ? { mcp_servers: config } : {}, env };
+interface Held {
+  kind: "held";
+  server: string;
+  tool: string;
+  arguments: unknown;
+}
+
+interface Loaded {
+  id: string;
+  /** The MCP config the thread was loaded with. */
+  mcpKey: string;
+}
+
+interface Active {
+  turn: Turn;
+  thread: string;
+  turnId: string | null;
+  mcp: Map<string, McpAttachment>;
+  /** Steers sent and not yet taken in: client message id → steer id. */
+  steers: Map<string, string>;
+  /** Tool calls: shown as MCP or as Codex's own, held until approved, or not shown. */
+  calls: Map<string, { kind: "mcp" | "builtin" | "skip" } | Held>;
+  end: (e: TurnEnd) => void;
+  /** Settles when the turn has ended. */
+  done: Promise<void>;
+  cancelled: boolean;
+  error: string | null;
+  /** The thread's token totals when the turn began, and now (Codex reports running totals). */
+  tokens: { base: TokenUsageBreakdown | null; now: TokenUsageBreakdown | null };
 }
 
 export class CodexEngine implements Engine {
   readonly name = "codex";
   readonly modelFamily = /^(gpt-|o[1-9]|codex)/i;
-  readonly canAskApproval = false;
-  readonly canSteer = false;
-  private conv: string | null = null;
-  private args: CodexArgs = { thread: {}, config: [] };
-  private abort: AbortController | null = null;
+  readonly canAskApproval = true;
+  readonly canSteer = true;
+  private rpc: AppServerRpc | null = null;
+  private loaded: Loaded | null = null;
+  private active: Active | null = null;
+  private model: string | null = null;
+  /** Other threads of this process (Codex's subagents) that are running. */
+  private readonly busyThreads = new Set<string>();
 
   constructor(private readonly opts: CodexEngineOptions) {}
-
-  private get binary(): string {
-    const v = this.opts.values.get("codex-bin");
-    return this.opts.codexPath ?? (typeof v === "string" ? v : "codex");
-  }
-
-  private baseEnv(): Record<string, string> {
-    const env: Record<string, string> = {};
-    for (const [k, v] of Object.entries(process.env)) if (v !== undefined) env[k] = v;
-    return { ...env, ...this.opts.env, CODEX_HOME: this.opts.agentDir };
-  }
 
   async start(): Promise<void> {
     const st = await fs.stat(this.opts.agentDir).catch(() => null);
     if (!st?.isDirectory()) throw new Error(`agent folder not found: ${this.opts.agentDir}`);
-    if (!this.opts.soul.trim()) throw new Error("the soul (agent instruction file) is empty");
-    if (this.opts.exec.length) throw new Error("--engine-exec is not supported by the codex engine (the Codex SDK starts the binary itself)");
-    this.args = parseCodexArgs(this.opts.engineArgs);
-    await fs.mkdir(path.dirname(path.join(this.opts.agentDir, SOUL_FILE)), { recursive: true });
-    await fs.writeFile(path.join(this.opts.agentDir, SOUL_FILE), this.opts.soul, "utf8");
+    checkExecPrefix(this.opts.exec);
+    checkCodexArgs(this.opts.engineArgs);
+    await this.server();
+  }
+
+  /** The app-server process, started (and initialized) when there is none. */
+  private async server(): Promise<AppServerRpc> {
+    if (this.rpc) return this.rpc;
+    const env: Record<string, string> = {};
+    for (const [k, v] of Object.entries(process.env)) if (v !== undefined) env[k] = v;
+    const child = spawnGroup(this.opts.exec, this.opts.codexPath ?? codexBinary(), ["app-server", ...this.opts.engineArgs], {
+      cwd: this.opts.agentDir,
+      env: { ...env, ...this.opts.env, CODEX_HOME: this.opts.agentDir },
+      stdio: ["pipe", "pipe", "pipe"],
+    });
+    child.stderr?.on("data", (d: Buffer) => process.stderr.write(`[codex] ${d.toString()}`));
+    const rpc = new AppServerRpc(child, { notification: (m, p) => this.notification(m, p), request: (m, p) => this.serverRequest(m, p) });
+    this.rpc = rpc;
+    void rpc.closed.then((why) => {
+      if (this.rpc === rpc) {
+        this.rpc = null;
+        this.loaded = null;
+        this.busyThreads.clear();
+      }
+      const a = this.active;
+      if (a) this.finish(a, { status: a.cancelled ? "cancelled" : "failed", error: `codex app-server ${why}`, usage: turnUsage(a) });
+    });
+    try {
+      await rpc.call("initialize", { clientInfo: { name: "greyfolk", title: null, version: "0.1.0" } });
+      rpc.notify("initialized");
+    } catch (err) {
+      killGroup(child);
+      throw new Error(`codex app-server did not start: ${err instanceof Error ? err.message : String(err)}`);
+    }
+    return rpc;
+  }
+
+  /** Codex keeps its own base instructions and reads the folder's AGENTS.md itself; `--soul FILE` is added. */
+  private instructions(): Record<string, string> {
+    return this.opts.extraInstructions ? { developerInstructions: this.opts.extraInstructions } : {};
+  }
+
+  /** Loads the turn's thread with the turn's MCP servers (a new one when `conversation` is null). */
+  private async thread(rpc: AppServerRpc, req: EngineTurn): Promise<string> {
+    const config = mcpConfig(req.mcp);
+    const mcpKey = JSON.stringify(config);
+    const l = this.loaded;
+    if (l && req.conversation === l.id && l.mcpKey === mcpKey) return l.id;
+    if (l) {
+      this.loaded = null;
+      await rpc.call("thread/unsubscribe", { threadId: l.id }).catch(() => {});
+    }
+    const common = { cwd: this.opts.agentDir, config, ...this.instructions(), ...(req.model ? { model: req.model } : {}) };
+    const r = req.conversation
+      ? await rpc.call<ThreadResumeResponse>("thread/resume", { threadId: req.conversation, excludeTurns: true, ...common })
+      : await rpc.call<ThreadStartResponse>("thread/start", common);
+    this.model = r.model ?? this.model;
+    this.loaded = { id: r.thread.id, mcpKey };
+    return r.thread.id;
   }
 
   async run(turn: Turn, req: EngineTurn): Promise<TurnEnd> {
-    if (this.abort) throw new Error("codex engine: a turn is already running");
+    if (this.active) throw new Error("codex engine: a turn is already running");
     if (turn.cancelRequested) return { status: "cancelled", error: null, usage: null };
-    const mcp = mcpConfig(req.mcp);
-    const codex = new Codex({
-      codexPathOverride: this.binary,
-      env: { ...this.baseEnv(), ...mcp.env },
-      config: { model_instructions_file: path.join(this.opts.agentDir, SOUL_FILE), ...mcp.config } as never,
-      configOverrides: this.args.config,
+    const rpc = await this.server();
+    const thread = await this.thread(rpc, req);
+    turn.conversationStarted(thread);
+    let active!: Active;
+    const ended = new Promise<TurnEnd>((resolve) => {
+      active = { turn, thread, turnId: null, mcp: new Map(req.mcp.map((m) => [m.label, m])), steers: new Map(), calls: new Map(), end: resolve, done: null as unknown as Promise<void>, cancelled: false, error: null, tokens: { base: null, now: null } };
     });
-    // codex exec cannot ask before a tool runs; the service refuses require_approval "always".
-    const threadOptions = { ...this.args.thread, workingDirectory: this.opts.agentDir, skipGitRepoCheck: true, approvalPolicy: "never" as const, ...(req.model ? { model: req.model } : {}) };
-    const thread = req.conversation ? codex.resumeThread(req.conversation, threadOptions) : codex.startThread(threadOptions);
-    this.abort = new AbortController();
+    active.done = ended.then(() => {});
+    this.active = active;
+    if (turn.cancelRequested) {
+      this.finish(active, { status: "cancelled", error: null, usage: null });
+      return ended;
+    }
     try {
-      const { events } = await thread.runStreamed(foldInput(req.input, req.instructions), { signal: this.abort.signal });
-      for await (const ev of events) {
-        const end = this.apply(ev, turn);
-        if (end) return end;
-      }
-      return { status: turn.cancelRequested ? "cancelled" : "failed", error: "codex ended without completing the turn", usage: null };
+      const r = await rpc.call<TurnStartResponse>("turn/start", { threadId: thread, input: [{ type: "text", text: foldInput(req.input, req.instructions), text_elements: [] }], ...(req.model ? { model: req.model } : {}) });
+      active.turnId ??= r.turn.id;
+      if (active.cancelled) void this.interrupt(active);
     } catch (err) {
-      return { status: turn.cancelRequested ? "cancelled" : "failed", error: err instanceof Error ? err.message : String(err), usage: null };
-    } finally {
-      this.abort = null;
+      this.finish(active, { status: "failed", error: `codex could not start the turn: ${err instanceof Error ? err.message : String(err)}`, usage: null });
     }
+    return ended;
   }
 
-  private apply(ev: ThreadEvent, turn: Turn): TurnEnd | null {
-    switch (ev.type) {
-      case "thread.started":
-        this.conv = ev.thread_id;
-        turn.conversationStarted(ev.thread_id);
-        return null;
-      case "item.started":
-      case "item.updated":
-      case "item.completed":
-        this.applyItem(ev.type, ev.item, turn);
-        return null;
-      case "turn.completed":
-        return { status: "completed", error: null, usage: ev.usage ? usage(ev.usage.input_tokens, ev.usage.output_tokens) : null };
-      case "turn.failed":
-        return { status: "failed", error: ev.error?.message ?? "turn failed", usage: null };
-      case "error":
-        return { status: "failed", error: ev.message, usage: null };
-      default:
-        return null;
-    }
+  private finish(a: Active, end: TurnEnd): void {
+    if (this.active !== a) return;
+    this.active = null;
+    a.end(end);
   }
 
-  private applyItem(phase: string, item: ThreadItem, turn: Turn): void {
-    if (item.type === "agent_message" && phase === "item.completed" && item.text) turn.textDone(item.text);
-    else if (item.type === "reasoning" && phase === "item.completed" && item.text) turn.reasoning(item.text, "summary");
-    else if (item.type === "mcp_tool_call") {
-      if (phase === "item.started") turn.mcpCallStarted(item.id, { server: item.server, name: item.tool, arguments: item.arguments });
-      if (phase === "item.completed") turn.mcpCallEnded(item.id, item.result ? item.result.content.map((c) => (c.type === "text" ? c.text : `[${c.type}]`)).join("\n") : "", item.error?.message ?? (item.status === "failed" ? "failed" : null));
-    } else if (item.type === "command_execution") {
-      if (phase === "item.started") turn.builtinStarted(item.id, { kind: "shell", command: item.command });
-      if (phase === "item.completed") turn.builtinEnded(item.id, { output: item.aggregated_output, failed: item.status === "failed" || (item.exit_code ?? 0) !== 0, exitCode: item.exit_code ?? null });
-    } else if (item.type === "file_change" && phase === "item.completed") {
-      for (const [i, c] of item.changes.entries()) {
-        const id = `${item.id}_${i}`;
-        turn.builtinStarted(id, { kind: "apply_patch", path: c.path, diff: "", operation: c.kind === "add" ? "create_file" : c.kind === "delete" ? "delete_file" : "update_file" });
-        turn.builtinEnded(id, { output: `${c.kind} ${c.path}`, failed: item.status === "failed" });
+  private notification(method: string, params: unknown): void {
+    const p = params as { threadId?: string };
+    if (method === "thread/status/changed") {
+      const { threadId, status } = params as Notification<"thread/status/changed">;
+      if (threadId !== this.loaded?.id) {
+        if (status.type === "active") this.busyThreads.add(threadId);
+        else this.busyThreads.delete(threadId);
       }
-    } else if (item.type === "web_search") {
-      if (phase === "item.started") turn.builtinStarted(item.id, { kind: "web_search", query: item.query });
-      if (phase === "item.completed") turn.builtinEnded(item.id, { output: "", failed: false });
+      return;
+    }
+    if (method === "thread/closed") {
+      this.busyThreads.delete((params as Notification<"thread/closed">).threadId);
+      return;
+    }
+    const a = this.active;
+    if (!a || p.threadId !== a.thread) return;
+    switch (method) {
+      case "turn/started":
+        a.turnId ??= (params as Notification<"turn/started">).turn.id;
+        return;
+      case "item/agentMessage/delta":
+        a.turn.textDelta((params as Notification<"item/agentMessage/delta">).delta);
+        return;
+      case "item/started":
+        return this.itemStarted(a, (params as Notification<"item/started">).item);
+      case "item/completed":
+        return this.itemCompleted(a, (params as Notification<"item/completed">).item);
+      case "thread/tokenUsage/updated": {
+        const { total, last } = (params as Notification<"thread/tokenUsage/updated">).tokenUsage;
+        a.tokens.base ??= minus(total, last);
+        a.tokens.now = total;
+        return;
+      }
+      case "error":
+        a.error = (params as Notification<"error">).error.message;
+        return;
+      case "turn/completed": {
+        const t = (params as Notification<"turn/completed">).turn;
+        const u = turnUsage(a);
+        if (t.status === "interrupted" || a.cancelled) return this.finish(a, { status: "cancelled", error: null, usage: u });
+        if (t.status === "completed") return this.finish(a, { status: "completed", error: null, usage: u });
+        return this.finish(a, { status: "failed", error: t.error?.message ?? a.error ?? `codex ended the turn ${t.status}`, usage: u });
+      }
+      default:
+        return;
     }
   }
 
-  async steer(): Promise<boolean> {
-    return false; // codex exec takes no input mid-turn
+  private itemStarted(a: Active, item: ThreadItem): void {
+    switch (item.type) {
+      case "userMessage": {
+        const steerId = item.clientId ? a.steers.get(item.clientId) : undefined;
+        if (!steerId) return;
+        a.steers.delete(item.clientId!);
+        a.turn.steerTakenIn(steerId);
+        return;
+      }
+      case "mcpToolCall": {
+        const server = a.mcp.get(item.server);
+        // A call that needs approval shows once it is approved (the elicitation decides).
+        if (server?.requireApproval === "always") a.calls.set(item.id, { kind: "held", server: item.server, tool: item.tool, arguments: item.arguments });
+        else this.startMcp(a, item.id, item.server, item.tool, item.arguments);
+        return;
+      }
+      case "fileChange":
+        item.changes.forEach((c, i) => this.startBuiltin(a, `${item.id}#${i}`, { kind: "apply_patch", path: c.path, diff: c.diff, operation: c.kind.type === "add" ? "create_file" : c.kind.type === "delete" ? "delete_file" : "update_file" }));
+        return;
+      default: {
+        const call = builtinOf(item);
+        if (call) this.startBuiltin(a, item.id, call);
+      }
+    }
+  }
+
+  private itemCompleted(a: Active, item: ThreadItem): void {
+    switch (item.type) {
+      case "agentMessage":
+        a.turn.textDone(item.text);
+        return;
+      case "reasoning":
+        if (item.content.length) a.turn.reasoning(item.content.join("\n"), "text");
+        else if (item.summary.length) a.turn.reasoning(item.summary.join("\n"), "summary");
+        return;
+      case "mcpToolCall": {
+        const call = a.calls.get(item.id);
+        a.calls.delete(item.id);
+        // Held and never asked about (the agent's approval policy lets Codex ask no one): it shows as it ended.
+        if (call?.kind === "held") this.startMcp(a, item.id, call.server, call.tool, call.arguments);
+        else if (call?.kind !== "mcp") return;
+        const output = (item.result?.content ?? []).map((c) => (typeof c === "object" && c && "text" in c ? String(c.text) : JSON.stringify(c))).join("\n");
+        a.turn.mcpCallEnded(item.id, output, item.status === "failed" ? (item.error?.message ?? "failed") : null);
+        return;
+      }
+      case "commandExecution":
+        if (!a.calls.has(item.id)) this.startBuiltin(a, item.id, { kind: "shell", command: item.command });
+        return this.endBuiltin(a, item.id, { output: item.aggregatedOutput ?? "", failed: item.status !== "completed", exitCode: item.exitCode });
+      case "fileChange":
+        item.changes.forEach((c, i) => {
+          const id = `${item.id}#${i}`;
+          if (!a.calls.has(id)) this.startBuiltin(a, id, { kind: "apply_patch", path: c.path, diff: c.diff, operation: c.kind.type === "add" ? "create_file" : c.kind.type === "delete" ? "delete_file" : "update_file" });
+          this.endBuiltin(a, id, { output: item.status, failed: item.status !== "completed" });
+        });
+        return;
+      default: {
+        const call = builtinOf(item);
+        if (!call) return;
+        if (!a.calls.has(item.id)) this.startBuiltin(a, item.id, call);
+        this.endBuiltin(a, item.id, resultOf(item));
+      }
+    }
+  }
+
+  private startMcp(a: Active, id: string, server: string, tool: string, args: unknown): void {
+    a.turn.mcpCallStarted(id, { server, name: tool, arguments: args });
+    a.calls.set(id, { kind: "mcp" });
+  }
+
+  private startBuiltin(a: Active, id: string, call: BuiltinCall): void {
+    a.turn.builtinStarted(id, call);
+    a.calls.set(id, { kind: "builtin" });
+  }
+
+  private endBuiltin(a: Active, id: string, result: { output: string; failed: boolean; exitCode?: number | null }): void {
+    const call = a.calls.get(id);
+    a.calls.delete(id);
+    if (call?.kind === "builtin") a.turn.builtinEnded(id, result);
+  }
+
+  /** Requests the app-server sends: MCP tool approvals become the standard approval request. */
+  private async serverRequest(method: string, params: unknown): Promise<unknown> {
+    switch (method) {
+      case "mcpServer/elicitation/request":
+        return this.elicitation(params as McpServerElicitationRequestParams);
+      case "item/commandExecution/requestApproval":
+      case "item/fileChange/requestApproval":
+        return { decision: "decline" };
+      case "execCommandApproval":
+      case "applyPatchApproval":
+        return { decision: { denied: { rejection: "No one can be asked to approve this." } } };
+      default:
+        throw new RpcError(`greyfolk does not answer ${method}`, -32601);
+    }
+  }
+
+  private async elicitation(p: McpServerElicitationRequestParams): Promise<McpServerElicitationRequestResponse> {
+    const decline: McpServerElicitationRequestResponse = { action: "decline", content: null, _meta: null };
+    const a = this.active;
+    const kind = (p._meta as { codex_approval_kind?: string } | null)?.codex_approval_kind;
+    if (!a || a.cancelled || p.threadId !== a.thread || (p.turnId !== null && p.turnId !== a.turnId) || kind !== "mcp_tool_call") return decline;
+    // The request names no call, so it is matched by server, tool and arguments. Calls that match equally
+    // are the same request; calls it cannot tell apart are refused rather than guessed.
+    const args = JSON.stringify((p._meta as { tool_params?: unknown }).tool_params ?? null);
+    const matches = [...a.calls.entries()].filter(
+      (e): e is [string, Held] => e[1].kind === "held" && e[1].server === p.serverName && p.message.includes(`"${e[1].tool}"`) && JSON.stringify(e[1].arguments ?? null) === args,
+    );
+    if (matches.length === 0 || new Set(matches.map(([, c]) => c.tool)).size > 1) return decline;
+    const [id, held] = matches[0]!;
+    a.calls.set(id, { kind: "skip" });
+    const ok = await a.turn.requestApproval({ server: held.server, name: held.tool, arguments: held.arguments });
+    if (!ok || this.active !== a || a.cancelled) return decline;
+    this.startMcp(a, id, held.server, held.tool, held.arguments);
+    return { action: "accept", content: null, _meta: null };
+  }
+
+  async steer(turn: Turn, id: string, input: InputMessage[]): Promise<boolean> {
+    const a = this.active;
+    const rpc = this.rpc;
+    if (!a || a.turn !== turn || a.cancelled || !a.turnId || !rpc) return false;
+    const clientId = randomUUID();
+    a.steers.set(clientId, id);
+    try {
+      await rpc.call("turn/steer", { threadId: a.thread, expectedTurnId: a.turnId, clientUserMessageId: clientId, input: [{ type: "text", text: foldInput(input, null), text_elements: [] }] });
+      return true;
+    } catch {
+      a.steers.delete(clientId);
+      return false;
+    }
   }
 
   async cancel(): Promise<void> {
-    this.abort?.abort();
+    const a = this.active;
+    if (!a) return;
+    a.cancelled = true;
+    if (a.turnId) await this.interrupt(a);
+  }
+
+  private async interrupt(a: Active): Promise<void> {
+    const rpc = this.rpc;
+    if (!rpc || !a.turnId) return;
+    await rpc.call("turn/interrupt", { threadId: a.thread, turnId: a.turnId }).catch(() => {});
+    // The process answers with turn/completed (interrupted); if it does not, it is stopped.
+    await Promise.race([a.done, new Promise((r) => setTimeout(r, 5000).unref())]);
+    if (this.active === a && this.rpc === rpc) killGroup(rpc.child);
   }
 
   state(): EngineState {
-    return { running: this.abort !== null, conversation: this.conv, model: null, subagents: 0 };
+    return { running: this.active !== null, conversation: this.loaded?.id ?? null, model: this.model, subagents: this.busyThreads.size };
   }
 
-  async conversation(): Promise<ConversationMessage[] | null> {
-    return null; // the Codex SDK has no reader for a thread's past
+  async conversation(id: string): Promise<ConversationMessage[] | null> {
+    const rpc = this.rpc;
+    if (!rpc) return null;
+    const out: ConversationMessage[] = [];
+    let cursor: string | null = null;
+    try {
+      do {
+        const page: ThreadItemsListResponse = await rpc.call<ThreadItemsListResponse>("thread/items/list", { threadId: id, ...(cursor ? { cursor } : {}) });
+        for (const { item } of page.data) {
+          if (item.type === "userMessage") out.push({ role: "user", text: item.content.map((c) => (c.type === "text" ? c.text : "")).join("") });
+          else if (item.type === "agentMessage") out.push({ role: "assistant", text: item.text });
+        }
+        cursor = page.nextCursor;
+      } while (cursor);
+    } catch {
+      return null;
+    }
+    return out.filter((m) => m.text);
   }
 
   async stop(): Promise<void> {
-    await this.cancel();
+    if (this.active) await this.cancel();
+    const rpc = this.rpc;
+    this.rpc = null;
+    if (rpc) killGroup(rpc.child);
   }
 }
 
-registerEngine({
-  name: "codex",
-  needsSoul: true,
-  options: [{ name: "codex-bin", kind: "string", help: "codex engine: the Codex CLI binary (default: codex on PATH)" }],
-  create: (o: EngineOptions) => new CodexEngine(o),
+const minus = (a: TokenUsageBreakdown, b: TokenUsageBreakdown): TokenUsageBreakdown => ({
+  totalTokens: a.totalTokens - b.totalTokens,
+  inputTokens: a.inputTokens - b.inputTokens,
+  cachedInputTokens: a.cachedInputTokens - b.cachedInputTokens,
+  cacheWriteInputTokens: a.cacheWriteInputTokens - b.cacheWriteInputTokens,
+  outputTokens: a.outputTokens - b.outputTokens,
+  reasoningOutputTokens: a.reasoningOutputTokens - b.reasoningOutputTokens,
 });
+
+/** The turn's usage: the thread's totals now less those when the turn began. */
+function turnUsage(a: Active): ResponseUsage | null {
+  const { base, now } = a.tokens;
+  if (!base || !now) return null;
+  const d = minus(now, base);
+  return usage(d.inputTokens, d.outputTokens, { cached: d.cachedInputTokens, cacheWrite: d.cacheWriteInputTokens, reasoning: d.reasoningOutputTokens, total: d.totalTokens });
+}
+
+/** Codex's own tools as the standard item that means the same (MCP and file changes aside). */
+function builtinOf(item: ThreadItem): BuiltinCall | null {
+  switch (item.type) {
+    case "commandExecution":
+      return { kind: "shell", command: item.command };
+    case "webSearch":
+      return { kind: "web_search", query: item.query };
+    case "collabAgentToolCall":
+      return { kind: "custom", name: item.tool, input: { prompt: item.prompt, model: item.model, receiver_thread_ids: item.receiverThreadIds } };
+    case "dynamicToolCall":
+      return { kind: "custom", name: item.namespace ? `${item.namespace}.${item.tool}` : item.tool, input: item.arguments };
+    case "imageView":
+      return { kind: "custom", name: "view_image", input: { path: item.path } };
+    default:
+      return null;
+  }
+}
+
+function resultOf(item: ThreadItem): { output: string; failed: boolean } {
+  switch (item.type) {
+    case "collabAgentToolCall":
+      return { output: JSON.stringify({ status: item.status, receiver_thread_ids: item.receiverThreadIds }), failed: item.status === "failed" };
+    case "dynamicToolCall":
+      return { output: JSON.stringify(item.contentItems ?? []), failed: item.success === false };
+    default:
+      return { output: "", failed: false };
+  }
+}
+
+registerEngine({ name: "codex", create: (o: EngineOptions) => new CodexEngine(o) });

@@ -95,12 +95,6 @@ export class ResponseLog {
     return this.records.get(id);
   }
 
-  /** True when `id` belongs to the latest turn (any response of its chain). */
-  isInLatestTurn(id: string): boolean {
-    const rec = this.records.get(id);
-    return !!rec && rec.turnId === this.latestTurnId;
-  }
-
   /** The id of the newest response (the end of the latest turn's chain), or null. */
   latestResponseId(): string | null {
     const turn = this.latestTurn();

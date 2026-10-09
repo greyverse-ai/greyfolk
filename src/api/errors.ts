@@ -3,7 +3,6 @@
 export type ApiErrorType =
   | "invalid_request_error"
   | "authentication_error"
-  | "not_found_error"
   | "server_error";
 
 export class ApiError extends Error {
