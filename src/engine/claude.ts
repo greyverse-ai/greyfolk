@@ -6,7 +6,7 @@
  *   The process runs in its own process group (through `--engine-exec` when given).
  * - The agent folder is Claude Code's config home (`cwd` = `CLAUDE_CONFIG_DIR`): its own settings
  *   files and its CLAUDE.md (the soul) there are read by Claude Code as usual (setting source `user`),
- *   under Claude Code's own system prompt; `--soul FILE` is appended to that prompt.
+ *   under Claude Code's own system prompt.
  * - The engine's own options (after `--`) go to Claude Code's command line as they are (SDK
  *   `extraArgs`), e.g. `--tools Agent,TodoWrite`.
  * - A turn's MCP servers go over the SDK's control channel (`setMcpServers`), never argv.
@@ -208,7 +208,7 @@ export class ClaudeEngine implements Engine {
       env: { ...process.env, ...this.opts.env, CLAUDE_CONFIG_DIR: this.opts.agentDir, DISABLE_AUTOUPDATER: "1" },
       abortController: proc.abort,
       // Claude Code's own system prompt; the agent's CLAUDE.md in its config home is read by Claude Code itself.
-      systemPrompt: { type: "preset", preset: "claude_code", ...(this.opts.extraInstructions ? { append: this.opts.extraInstructions } : {}) },
+      systemPrompt: { type: "preset", preset: "claude_code" },
       settingSources: ["user"],
       extraArgs: this.extraArgs,
       includePartialMessages: true,

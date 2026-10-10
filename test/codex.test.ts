@@ -33,11 +33,11 @@ afterAll(async () => {
 });
 
 /** A codex agent on the real pinned binary, its model the mock (no login anywhere). */
-async function codexAgent(extra: string[] = [], extraInstructions: string | null = null) {
+async function codexAgent(extra: string[] = []) {
   const agentDir = await fs.mkdtemp(path.join(os.tmpdir(), "greyfolk-codex-"));
   await fs.writeFile(path.join(agentDir, "AGENTS.md"), "You are SOUL-MARKER.\n");
   const engineArgs = ["-c", 'model_provider="mock"', "-c", `model_providers.mock={name="mock",base_url="${model.url}",wire_api="responses"}`, "-c", 'model="gpt-mock"', "-c", 'sandbox_mode="read-only"', ...extra];
-  const engine = new CodexEngine({ agentDir, extraInstructions, engineArgs, exec: [], values: new Map(), env: { HOME: agentDir } });
+  const engine = new CodexEngine({ agentDir, engineArgs, exec: [], values: new Map(), env: { HOME: agentDir } });
   const agent = new AgentService({ engine, modelPolicy: "fixed" });
   await agent.init();
   agents.push(agent);
@@ -55,12 +55,10 @@ describe("codex engine (codex app-server)", () => {
     expect(() => checkCodexArgs(["-c", "x=1", "--enable", "f"])).not.toThrow();
   });
 
-  it("Codex reads the folder's AGENTS.md itself under its own instructions; --soul adds to them", async () => {
-    for (const [extra, want] of [[null, "folder=true added=false own=true"], ["ADDED-MARKER", "folder=true added=true own=true"]] as const) {
-      const { agent } = await codexAgent([], extra);
-      const r = await agent.create(req("[soul?]"));
-      expect(textOf((await collectChain(agent, r.id)).last)).toBe(want);
-    }
+  it("Codex reads the folder's AGENTS.md itself under its own instructions", async () => {
+    const { agent } = await codexAgent();
+    const r = await agent.create(req("[soul?]"));
+    expect(textOf((await collectChain(agent, r.id)).last)).toBe("folder=true added=false own=true");
   });
 
   it("runs turns in one process: MCP and shell calls as standard items; the next turn's credentials reach the MCP server", async () => {

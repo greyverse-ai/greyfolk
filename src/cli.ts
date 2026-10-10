@@ -13,13 +13,6 @@ import { CORE_OPTIONS, formatHelp, parseArgv, splitEngineArgs, withDefaults } fr
 import { engineNames, getEngine } from "./engine/registry.js";
 import "./engine/index.js";
 
-/** `--soul FILE`: a file added, as it is, to the engine's own instructions (the engine reads the folder's AGENTS.md / CLAUDE.md itself). */
-async function readExtraInstructions(agentDir: string, file: string | undefined): Promise<{ text: string | null; summary: string }> {
-  if (!file) return { text: null, summary: "the engine's own" };
-  const f = path.resolve(agentDir, file);
-  return { text: await fs.readFile(f, "utf8"), summary: `${f} added` };
-}
-
 async function main(): Promise<void> {
   const specs = CORE_OPTIONS;
   const { own, engine: engineArgs } = splitEngineArgs(process.argv.slice(2));
@@ -35,14 +28,13 @@ async function main(): Promise<void> {
   const o = resolveOptions(withDefaults(specs, given), { readKeyFromFd }, engineNames(), engineArgs);
   const def = getEngine(o.engine);
   const auth = new BearerAuth(o.key);
-  const extra = await readExtraInstructions(o.agentDir, o.soulOverride);
   const agent = new AgentService({
-    engine: def.create({ agentDir: o.agentDir, extraInstructions: extra.text, engineArgs: o.engineArgs, exec: o.engineExec, values: o.values }),
+    engine: def.create({ agentDir: o.agentDir, engineArgs: o.engineArgs, exec: o.engineExec, values: o.values }),
     modelPolicy: o.modelPolicy,
   });
   await agent.init();
   const server = await startServer(agent, auth, o.listen);
-  process.stderr.write(`greyfolk listening on ${server.address} (engine=${o.engine}, engine options: ${o.engineArgs.join(" ") || "none"}, agent=${o.agentDir}, instructions: ${extra.summary})\n`);
+  process.stderr.write(`greyfolk listening on ${server.address} (engine=${o.engine}, engine options: ${o.engineArgs.join(" ") || "none"}, agent=${o.agentDir})\n`);
 
   const shutdown = async (): Promise<void> => {
     await server.close();

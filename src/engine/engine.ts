@@ -12,11 +12,6 @@ import type { Turn, TurnEnd } from "../service/turn.js";
 
 export interface EngineOptions {
   agentDir: string;
-  /**
-   * Instructions added to the engine's own (from `--soul FILE`), or null. The agent's instruction file
-   * in the folder (CLAUDE.md / AGENTS.md) is read by the engine itself, as usual.
-   */
-  extraInstructions: string | null;
   /** The engine's own options (after `--`), handed to its SDK as they are. */
   engineArgs: string[];
   /** Launcher prefix the engine is started through (empty = greyfolk starts it itself). */

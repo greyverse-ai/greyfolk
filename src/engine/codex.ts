@@ -5,7 +5,7 @@
  * - One app-server process for the agent, started with the engine's own options (after `--`) as
  *   they are, e.g. `-c sandbox_mode="workspace-write"`, `--enable F`. The agent folder is Codex's
  *   home (`CODEX_HOME`) and working folder: its own `config.toml` and AGENTS.md (the soul) there are
- *   read by Codex as usual, under Codex's own base instructions; `--soul FILE` is added to them.
+ *   read by Codex as usual, under Codex's own base instructions.
  * - A conversation is a Codex thread; the session, compaction and Codex's own subagents stay
  *   Codex's. Turns, steer (`turn/steer`) and cancel (`turn/interrupt`) are calls into the process.
  * - A turn's MCP servers are the thread's config, sent over the process's stdin (never argv, the
@@ -157,10 +157,6 @@ export class CodexEngine implements Engine {
     return rpc;
   }
 
-  /** Codex keeps its own base instructions and reads the folder's AGENTS.md itself; `--soul FILE` is added. */
-  private instructions(): Record<string, string> {
-    return this.opts.extraInstructions ? { developerInstructions: this.opts.extraInstructions } : {};
-  }
 
   /** Loads the turn's thread with the turn's MCP servers (a new one when `conversation` is null). */
   private async thread(rpc: AppServerRpc, req: EngineTurn): Promise<string> {
@@ -172,7 +168,7 @@ export class CodexEngine implements Engine {
       this.loaded = null;
       await rpc.call("thread/unsubscribe", { threadId: l.id }).catch(() => {});
     }
-    const common = { cwd: this.opts.agentDir, config, ...this.instructions(), ...(req.model ? { model: req.model } : {}) };
+    const common = { cwd: this.opts.agentDir, config, ...(req.model ? { model: req.model } : {}) };
     const r = req.conversation
       ? await rpc.call<ThreadResumeResponse>("thread/resume", { threadId: req.conversation, excludeTurns: true, ...common })
       : await rpc.call<ThreadStartResponse>("thread/start", common);

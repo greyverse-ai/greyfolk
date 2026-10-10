@@ -11,7 +11,7 @@ Engines: the Claude Agent SDK (`claude`) and Codex's own long-running interface 
 
 ```
 greyfolk --listen unix:/run/agent.sock|tcp:127.0.0.1:8900|fd:3 --key-fd 4 --agent-dir /agents/alice \
-         --engine claude|codex [--model fixed|request] [--soul FILE] [--engine-exec "<launcher>"] \
+         --engine claude|codex [--model fixed|request] [--engine-exec "<launcher>"] \
          [-- <the engine's own options, passed to its SDK as they are>]
 ```
 
@@ -23,7 +23,6 @@ greyfolk --listen unix:/run/agent.sock|tcp:127.0.0.1:8900|fd:3 --key-fd 4 --agen
 | `--agent-dir` | the agent folder = the engine's config home (`CLAUDE_CONFIG_DIR` / `CODEX_HOME`); the engine reads its own settings files there as usual |
 | `--engine` | required |
 | `--model` | `fixed` (default): the engine's own model setting; `request`: a request's `model`, within the engine's family |
-| `--soul` | an instruction file added to the engine's own instructions. The engine itself reads the folder's `CLAUDE.md` (Claude Code) / `AGENTS.md` (Codex) as usual, under its own base prompt; greyfolk never replaces that prompt |
 | `--engine-exec` | a launcher prefix the engine process is started through (e.g. a sandbox wrapper) |
 | `--engines` | print the engines this greyfolk has, one per line, and exit |
 | `-- …` | the engine's own options, as they are. Claude: Claude Code CLI options (SDK `extraArgs`, e.g. `--tools Agent,TodoWrite`). Codex: `codex app-server` options (`-c key=value`, `--enable F`, `--disable F`, …); only its transport options (`--listen`, `--stdio`, `--ws-*`) are greyfolk's own and refused |

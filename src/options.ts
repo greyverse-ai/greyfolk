@@ -27,7 +27,6 @@ export const CORE_OPTIONS: OptionSpec[] = [
   { name: "engine", kind: "string", help: "the engine to run (required; see the list below)" },
   { name: "engine-exec", kind: "string", help: "a launcher prefix the engine is started through (e.g. a sandbox wrapper); without it greyfolk starts the engine itself" },
   { name: "model", kind: "string", values: ["fixed", "request"], default: "fixed", help: "fixed: a request's model is ignored; request: it may choose within the engine's family" },
-  { name: "soul", kind: "string", help: "an instruction file added to the engine's own (the engine reads AGENTS.md / CLAUDE.md in the agent folder itself)" },
   { name: "help", kind: "flag", default: false, help: "print this list" },
   { name: "engines", kind: "flag", default: false, help: "print the engines this greyfolk has, one per line" },
 ];

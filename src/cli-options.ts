@@ -22,7 +22,6 @@ export interface StartOptions {
   /** The engine's own options (after `--`), for its SDK as they are. */
   engineArgs: string[];
   modelPolicy: ModelPolicy;
-  soulOverride: string | undefined;
   /** Every resolved option, for the engine's own options. */
   values: OptionValues;
 }
@@ -68,7 +67,6 @@ export function resolveOptions(v: OptionValues, keys: KeyReaders, engines: strin
     engineExec: parseExecPrefix(str(v, "engine-exec")),
     engineArgs,
     modelPolicy: (str(v, "model") ?? "fixed") as ModelPolicy,
-    soulOverride: str(v, "soul"),
     values: v,
   };
 }

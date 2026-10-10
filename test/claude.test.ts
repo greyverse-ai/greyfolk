@@ -6,9 +6,9 @@ import { ClaudeEngine, builtinCall, toExtraArgs } from "../src/engine/claude.js"
 import { AgentService } from "../src/service/agent.js";
 import { collectChain, req, textOf } from "./helpers.js";
 
-async function mk(engineArgs: string[] = [], extraInstructions: string | null = null) {
+async function mk(engineArgs: string[] = []) {
   const agentDir = await fs.mkdtemp(path.join(os.tmpdir(), "greyfolk-claude-"));
-  const e = new ClaudeEngine({ agentDir, extraInstructions, engineArgs, exec: [], values: new Map(), queryFn: () => { throw new Error("not started"); } });
+  const e = new ClaudeEngine({ agentDir, engineArgs, exec: [], values: new Map(), queryFn: () => { throw new Error("not started"); } });
   await e.start();
   return { agentDir, e };
 }
@@ -80,7 +80,7 @@ async function scripted() {
     queries.push(q);
     return q;
   }) as never;
-  const e = new ClaudeEngine({ agentDir, extraInstructions: null, engineArgs: [], exec: [], values: new Map(), queryFn });
+  const e = new ClaudeEngine({ agentDir, engineArgs: [], exec: [], values: new Map(), queryFn });
   await e.start();
   const agent = new AgentService({ engine: e, modelPolicy: "fixed" });
   return { agent, queries };
@@ -98,7 +98,6 @@ describe("claude engine (Claude Agent SDK)", () => {
     expect(o.env?.CLAUDE_CONFIG_DIR).toBe(agentDir);
     expect(o.settingSources).toEqual(["user"]);
     expect(o.systemPrompt).toEqual({ type: "preset", preset: "claude_code" });
-    expect((await mk([], "Added.")).e.buildOptions(proc(), null).systemPrompt).toEqual({ type: "preset", preset: "claude_code", append: "Added." });
     expect(o.mcpServers).toBeUndefined(); // a turn's servers go over the control channel
     expect(o.tools).toBeUndefined(); // greyfolk sets no tools of its own
     expect(e.buildOptions(proc(), "sess-1").resume).toBe("sess-1");
