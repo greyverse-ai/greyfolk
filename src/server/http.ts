@@ -65,7 +65,7 @@ function chainEnd(agent: ResponsesApi, responseId: string): Promise<AgentRespons
   });
 }
 
-function streamChain(agent: ResponsesApi, responseId: string, startingAfter: number, req: http.IncomingMessage, res: http.ServerResponse, cancelOnClose: boolean): void {
+function streamChain(agent: ResponsesApi, responseId: string, startingAfter: number, res: http.ServerResponse, cancelOnClose: boolean): void {
   const sse = new SseWriter(res);
   let done = false;
   const unsub = agent.stream(responseId, startingAfter, (ev) => {
@@ -99,7 +99,7 @@ export function createRequestHandler(agent: ResponsesApi, auth: BearerAuth): (re
       if (parts.length === 2 && method === "POST") {
         const body = (await readJsonBody(req)) as CreateParams;
         const response = await agent.create(body);
-        if (body.stream === true) return streamChain(agent, response.id, -1, req, res, true);
+        if (body.stream === true) return streamChain(agent, response.id, -1, res, true);
         // A background response is returned at once; the caller polls or re-attaches (the standard).
         if (body.background === true) return sendJson(res, 200, response);
         return sendJson(res, 200, await chainEnd(agent, response.id));
@@ -109,7 +109,7 @@ export function createRequestHandler(agent: ResponsesApi, auth: BearerAuth): (re
         if (url.searchParams.get("stream") !== "true") return sendJson(res, 200, response);
         const after = Number(url.searchParams.get("starting_after") ?? "-1");
         if (!Number.isInteger(after)) throw ApiError.invalid("'starting_after' must be an integer.", null, "starting_after");
-        return streamChain(agent, parts[2]!, after, req, res, false);
+        return streamChain(agent, parts[2]!, after, res, false);
       }
       if (parts.length === 4 && parts[3] === "cancel" && method === "POST") return sendJson(res, 200, await agent.cancel(parts[2]!));
     }

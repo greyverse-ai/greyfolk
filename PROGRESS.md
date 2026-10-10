@@ -2,7 +2,7 @@
 
 ## 2026-10-09: rebuilt SDK-first
 
-Records of earlier versions: `99e4ce8` (first implementation), `2337cd4` (Responses-port rework). Both rebuilt
+Records of earlier versions: `49de276` (first implementation), `0ea22d9` (Responses-port rework). Both rebuilt
 harness features (held subagent results, subagent events, session records, its own status, tool-kind control,
 subagent profiles); this version drops all of that (intent: agent/operations — greyfolk is the engine SDK behind
 the OpenAI Responses protocol, nothing more).
@@ -14,7 +14,7 @@ them) · `api/` (official `openai` types, request parsing) · `mcp/` (MCP entrie
 
 ## 2026-10-09: review fixes; Codex on `codex app-server`
 
-Record before this step: `1480427`. The Codex SDK started `codex exec` for every turn (and every MCP server
+Record before this step: `daaed86`. The Codex SDK started `codex exec` for every turn (and every MCP server
 with it); the engine now talks to one `codex app-server` process for the agent (intent: one engine process kept
 across turns). Steer, approvals and the conversation reader work on Codex too. The protocol types are codex's
 own generated code (`src/engine/codex-protocol`, `npm run gen:codex-protocol` from the pinned binary).

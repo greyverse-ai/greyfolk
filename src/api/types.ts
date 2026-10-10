@@ -3,7 +3,7 @@
  * greyfolk adds nothing of its own to it; its state is read through a standard health check.
  */
 import type { Limits } from "./limits.js";
-import type { Response, ResponseCreateParamsBase, ResponseStreamEvent, ResponseSteerAcceptedEvent, ResponseSteerErrorCode, ResponseSteerFailedEvent, ResponseSteerInput, Tool } from "openai/resources/responses/responses";
+import type { Response, ResponseCreateParamsBase, ResponseStreamEvent, ResponseSteerAcceptedEvent, ResponseSteerErrorCode, ResponseSteerInput, Tool } from "openai/resources/responses/responses";
 import type { ConversationItemList } from "openai/resources/conversations/items";
 
 export type * from "openai/resources/responses/responses";
