@@ -17,8 +17,6 @@ export interface OptionSpec {
   /** Allowed values (for a list: of each item). */
   values?: readonly string[];
   default?: string | boolean | string[];
-  /** Refused with this message (options that were removed on purpose). */
-  removed?: string;
 }
 
 export const CORE_OPTIONS: OptionSpec[] = [
@@ -31,14 +29,7 @@ export const CORE_OPTIONS: OptionSpec[] = [
   { name: "model", kind: "string", values: ["fixed", "request"], default: "fixed", help: "fixed: a request's model is ignored; request: it may choose within the engine's family" },
   { name: "soul", kind: "string", help: "an instruction file added to the engine's own (the engine reads AGENTS.md / CLAUDE.md in the agent folder itself)" },
   { name: "help", kind: "flag", default: false, help: "print this list" },
-  { name: "disable-tools", kind: "list", removed: "--disable-tools was removed: pass the engine's own options after --" },
-  { name: "no-host-tools", kind: "flag", removed: "--no-host-tools was removed: pass the engine's own options after -- (e.g. Claude Code's --tools)" },
-  { name: "harness", kind: "string", removed: "--harness was renamed: name the engine with --engine" },
-  { name: "harness-exec", kind: "string", removed: "--harness-exec was renamed: use --engine-exec" },
-  { name: "dev-key", kind: "string", removed: "--dev-key was removed: the bearer key never travels in arguments; hand it over on an inherited file descriptor with --key-fd N" },
-  { name: "subagent-profile", kind: "string", removed: "--subagent-profile was removed: subagents are the engine's own (define them in the engine's settings in the agent folder)" },
-  { name: "reset-archive", kind: "string", removed: "--reset-archive was removed: a new conversation is a request without a conversation id" },
-  { name: "key-file", kind: "string", removed: "--key-file was removed: the bearer key never lives in a file the sandbox might read; hand it over on an inherited file descriptor with --key-fd N (e.g. --key-fd 3 3<key)" },
+  { name: "engines", kind: "flag", default: false, help: "print the engines this greyfolk has, one per line" },
 ];
 
 export type OptionValues = Map<string, string | boolean | string[]>;
@@ -46,7 +37,6 @@ export type OptionValues = Map<string, string | boolean | string[]>;
 function specOf(specs: OptionSpec[], name: string): OptionSpec {
   const spec = specs.find((s) => s.name === name);
   if (!spec) throw new Error(`unknown option --${name}`);
-  if (spec.removed) throw new Error(spec.removed);
   return spec;
 }
 
@@ -109,7 +99,6 @@ export function withDefaults(specs: OptionSpec[], given: OptionValues): OptionVa
 export function formatHelp(specs: OptionSpec[], engines: string[]): string {
   const lines = ["greyfolk — one agent served as an OpenAI Responses-shaped server", "", "options:"];
   for (const s of specs) {
-    if (s.removed) continue;
     const arg = s.kind === "flag" ? "" : s.kind === "list" ? " a,b,…" : " VALUE";
     const def = s.default !== undefined && s.default !== false && !(Array.isArray(s.default) && s.default.length === 0) ? ` (default ${String(s.default)})` : "";
     lines.push(`  --${s.name}${arg}`.padEnd(28) + (s.help ?? "") + def);

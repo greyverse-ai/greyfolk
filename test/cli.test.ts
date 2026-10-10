@@ -20,10 +20,7 @@ describe("start options", () => {
     expect(o.engineArgs).toEqual(["--tools", "Agent,TodoWrite", "--model", "x"]);
   });
 
-  it("removed options point at what replaced them; unknown ones are refused", () => {
-    expect(() => resolve([...base, "--engine", "claude", "--no-host-tools"])).toThrow(/after --/);
-    expect(() => resolve([...base, "--engine", "claude", "--disable-tools", "shell"])).toThrow(/after --/);
-    expect(() => resolve([...base, "--engine", "claude", "--harness-exec", "x"])).toThrow(/--engine-exec/);
+  it("unknown options are refused", () => {
     expect(() => resolve([...base, "--engine", "claude", "--nope", "x"])).toThrow(/unknown option --nope/);
   });
 
@@ -34,7 +31,7 @@ describe("start options", () => {
   });
 
   it("never takes the bearer key from argv", () => {
-    expect(() => resolve(["--listen", "tcp:127.0.0.1:0", "--engine", "fake", "--dev-key", "x"])).toThrow(/--dev-key was removed/);
+    expect(() => resolve(["--listen", "tcp:127.0.0.1:0", "--engine", "fake", "--dev-key", "x"])).toThrow(/unknown option --dev-key/);
     expect(() => resolve(["--listen", "tcp:127.0.0.1:0", "--engine", "fake"])).toThrow(/--key-fd/);
     expect(resolve([...base, "--engine", "fake"]).key).toBe("k-from-fd");
   });

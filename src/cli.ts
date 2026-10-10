@@ -41,6 +41,10 @@ async function main(): Promise<void> {
     process.stdout.write(`${formatHelp(specs, engineNames())}\n`);
     return;
   }
+  if (given.get("engines") === true) {
+    process.stdout.write(`${engineNames().join("\n")}\n`);
+    return;
+  }
   const o = resolveOptions(withDefaults(specs, given), { readKeyFromFd }, engineNames(), engineArgs);
   const def = getEngine(o.engine);
   const auth = new BearerAuth(o.key);
