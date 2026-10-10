@@ -4,7 +4,6 @@ import * as path from "node:path";
 import { describe, expect, it } from "vitest";
 import { ClaudeEngine, builtinCall, toExtraArgs } from "../src/engine/claude.js";
 import { AgentService } from "../src/service/agent.js";
-import { defaultToolAttacher } from "../src/mcp/translate.js";
 import { collectChain, req, textOf } from "./helpers.js";
 
 async function mk(engineArgs: string[] = [], extraInstructions: string | null = null) {
@@ -83,7 +82,7 @@ async function scripted() {
   }) as never;
   const e = new ClaudeEngine({ agentDir, extraInstructions: null, engineArgs: [], exec: [], values: new Map(), queryFn });
   await e.start();
-  const agent = new AgentService({ engine: e, modelPolicy: "fixed", attachTools: defaultToolAttacher() });
+  const agent = new AgentService({ engine: e, modelPolicy: "fixed" });
   return { agent, queries };
 }
 const tick = () => new Promise((r) => setTimeout(r, 5));

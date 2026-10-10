@@ -4,7 +4,6 @@ import * as path from "node:path";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
 import { CodexEngine, checkCodexArgs, mcpConfig } from "../src/engine/codex.js";
 import { AgentService } from "../src/service/agent.js";
-import { defaultToolAttacher } from "../src/mcp/translate.js";
 import type { AgentResponse } from "../src/api/types.js";
 import { collectChain, req, sleep, textOf } from "./helpers.js";
 import { mcpCall, message, mockMcp, mockModel, shellCall } from "./codex-mocks.js";
@@ -39,7 +38,7 @@ async function codexAgent(extra: string[] = [], extraInstructions: string | null
   await fs.writeFile(path.join(agentDir, "AGENTS.md"), "You are SOUL-MARKER.\n");
   const engineArgs = ["-c", 'model_provider="mock"', "-c", `model_providers.mock={name="mock",base_url="${model.url}",wire_api="responses"}`, "-c", 'model="gpt-mock"', "-c", 'sandbox_mode="read-only"', ...extra];
   const engine = new CodexEngine({ agentDir, extraInstructions, engineArgs, exec: [], values: new Map(), env: { HOME: agentDir } });
-  const agent = new AgentService({ engine, modelPolicy: "fixed", attachTools: defaultToolAttacher() });
+  const agent = new AgentService({ engine, modelPolicy: "fixed" });
   await agent.init();
   agents.push(agent);
   return { agent, engine, agentDir };

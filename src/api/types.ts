@@ -71,7 +71,7 @@ export interface ResponsesApi {
   /** `GET /v1/conversations/{id}/items`, read by the engine from its own session. */
   conversationItems(conversationId: string): Promise<ConversationItemList>;
   state(): AgentState;
-  /** `GET /limits`: the engine account's own usage limits (null when the engine reports none). */
-  limits(refresh: boolean): Promise<Limits | null>;
+  /** The engine account's own usage limits, for the health check (null when the engine reports none). */
+  limits(): Promise<Limits | null>;
   close(): Promise<void>;
 }

@@ -41,8 +41,3 @@ export function translateMcpTools(tools: McpTool[]): McpAttachment[] {
     };
   });
 }
-
-/** The attacher the service uses. */
-export function defaultToolAttacher(): (tools: McpTool[]) => McpAttachment[] {
-  return translateMcpTools;
-}

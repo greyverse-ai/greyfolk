@@ -211,7 +211,6 @@ export class ClaudeEngine implements Engine {
       systemPrompt: { type: "preset", preset: "claude_code", ...(this.opts.extraInstructions ? { append: this.opts.extraInstructions } : {}) },
       settingSources: ["user"],
       extraArgs: this.extraArgs,
-      permissionMode: "default",
       includePartialMessages: true,
       persistSession: true,
       hooks: { PreToolUse: [{ hooks: [this.preToolUse] }] },

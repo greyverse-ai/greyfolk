@@ -12,7 +12,6 @@ import { startServer } from "./server/index.js";
 import { resolveOptions } from "./cli-options.js";
 import { CORE_OPTIONS, formatHelp, parseArgv, splitEngineArgs, withDefaults } from "./options.js";
 import { engineNames, getEngine } from "./engine/registry.js";
-import { defaultToolAttacher } from "./mcp/translate.js";
 import "./engine/index.js";
 
 /**
@@ -52,7 +51,6 @@ async function main(): Promise<void> {
   const agent = new AgentService({
     engine: def.create({ agentDir: o.agentDir, extraInstructions: extra.text, engineArgs: o.engineArgs, exec: o.engineExec, values: o.values }),
     modelPolicy: o.modelPolicy,
-    attachTools: defaultToolAttacher(),
   });
   await agent.init();
   const server = await startServer(agent, auth, o.listen);

@@ -7,7 +7,7 @@ import type { Limits } from "../api/limits.js";
 import type { AgentResponse, AgentState, ConversationItemList, CreateParams, McpTool, ResponseSteerInput, ResponsesApi, SteerFailure, SteerOutcome, StreamListener } from "../api/types.js";
 import { ApiError } from "../api/errors.js";
 import { normaliseInput, parseCreateRequest, type InputMessage } from "../api/input.js";
-import type { McpAttachment } from "../mcp/translate.js";
+import { translateMcpTools } from "../mcp/translate.js";
 import type { Engine } from "../engine/engine.js";
 import { newId, ResponseLog, type ResponseRecord } from "./response-log.js";
 import { Turn, type TurnEnd } from "./turn.js";
@@ -17,8 +17,6 @@ export type ModelPolicy = "fixed" | "request";
 export interface AgentServiceOptions {
   engine: Engine;
   modelPolicy: ModelPolicy;
-  /** Turns a request's MCP tools into transports the engine attaches (spec §4). */
-  attachTools: (tools: McpTool[]) => McpAttachment[];
 }
 
 const TOO_LATE: SteerFailure = { code: "response_not_active", message: "The response ended before the input could be taken in; start a new turn." };
@@ -61,7 +59,7 @@ export class AgentService implements ResponsesApi {
     if (this.opts.modelPolicy === "request" && req.model && !this.engine.modelFamily.test(req.model)) {
       throw ApiError.invalid(`Model '${req.model}' is not in the ${this.engine.name} engine's family.`, "model_not_in_family", "model");
     }
-    const mcp = this.opts.attachTools(req.tools);
+    const mcp = translateMcpTools(req.tools);
     const state = this.engine.state();
     // previous_response_id continues the conversation that response belongs to.
     const conversation = req.conversation ?? (req.previous_response_id ? (this.log.get(req.previous_response_id)?.response.conversation?.id ?? null) : null);
@@ -169,8 +167,13 @@ export class AgentService implements ResponsesApi {
     return { object: "list", data, first_id: data[0]?.id ?? "", last_id: data.at(-1)?.id ?? "", has_more: false } as unknown as ConversationItemList;
   }
 
-  async limits(refresh: boolean): Promise<Limits | null> {
-    return this.engine.limits ? this.engine.limits(refresh) : null;
+  /** The engine account's limits as last reported; asked again (briefly) when that is over a minute old. */
+  async limits(): Promise<Limits | null> {
+    if (!this.engine.limits) return null;
+    const known = await this.engine.limits(false);
+    if (known && Date.now() / 1000 - known.observed_at < 60) return known;
+    const fresh = await Promise.race([this.engine.limits(true), new Promise<null>((r) => setTimeout(() => r(null), 2000))]);
+    return fresh ?? known;
   }
 
   state(): AgentState {
