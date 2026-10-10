@@ -2,6 +2,7 @@
  * The protocol: the OpenAI Responses API, with the official SDK's types (npm `openai`).
  * greyfolk adds nothing of its own to it; its state is read through a standard health check.
  */
+import type { Limits } from "./limits.js";
 import type { Response, ResponseCreateParamsBase, ResponseStreamEvent, ResponseSteerAcceptedEvent, ResponseSteerErrorCode, ResponseSteerFailedEvent, ResponseSteerInput, Tool } from "openai/resources/responses/responses";
 import type { ConversationItemList } from "openai/resources/conversations/items";
 
@@ -70,5 +71,7 @@ export interface ResponsesApi {
   /** `GET /v1/conversations/{id}/items`, read by the engine from its own session. */
   conversationItems(conversationId: string): Promise<ConversationItemList>;
   state(): AgentState;
+  /** `GET /limits`: the engine account's own usage limits (null when the engine reports none). */
+  limits(refresh: boolean): Promise<Limits | null>;
   close(): Promise<void>;
 }

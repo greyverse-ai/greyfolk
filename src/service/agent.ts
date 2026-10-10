@@ -3,6 +3,7 @@
  * strategy. It keeps the one thing the protocol needs and the SDKs do not: the responses of the
  * current process, for streaming and re-attach. Everything else is the engine's.
  */
+import type { Limits } from "../api/limits.js";
 import type { AgentResponse, AgentState, ConversationItemList, CreateParams, McpTool, ResponseSteerInput, ResponsesApi, SteerFailure, SteerOutcome, StreamListener } from "../api/types.js";
 import { ApiError } from "../api/errors.js";
 import { normaliseInput, parseCreateRequest, type InputMessage } from "../api/input.js";
@@ -166,6 +167,10 @@ export class AgentService implements ResponsesApi {
       content: [m.role === "user" ? { type: "input_text" as const, text: m.text } : { type: "output_text" as const, text: m.text, annotations: [] }],
     }));
     return { object: "list", data, first_id: data[0]?.id ?? "", last_id: data.at(-1)?.id ?? "", has_more: false } as unknown as ConversationItemList;
+  }
+
+  async limits(refresh: boolean): Promise<Limits | null> {
+    return this.engine.limits ? this.engine.limits(refresh) : null;
   }
 
   state(): AgentState {

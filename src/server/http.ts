@@ -94,6 +94,7 @@ export function createRequestHandler(agent: ResponsesApi, auth: BearerAuth): (re
     const method = req.method ?? "GET";
     const parts = url.pathname.split("/").filter(Boolean);
     if (parts.length === 1 && parts[0] === "health" && method === "GET") return sendJson(res, 200, toHealth(agent.state()), HEALTH_CONTENT_TYPE);
+    if (parts.length === 1 && parts[0] === "limits" && method === "GET") return sendJson(res, 200, { limits: await agent.limits(url.searchParams.get("refresh") === "true") });
     if (parts[0] === "v1" && parts[1] === "responses") {
       if (parts.length === 2 && method === "POST") {
         const body = (await readJsonBody(req)) as CreateParams;

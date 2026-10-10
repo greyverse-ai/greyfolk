@@ -4,6 +4,7 @@
  * else. Every harness feature (sessions, compaction, tools, subagents, late results) stays the
  * SDK's own (intent: agent/operations).
  */
+import type { Limits } from "../api/limits.js";
 import type { InputMessage } from "../api/input.js";
 import type { McpAttachment } from "../mcp/translate.js";
 import type { OptionValues } from "../options.js";
@@ -64,5 +65,7 @@ export interface Engine {
   state(): EngineState;
   /** The conversation as the engine's session holds it, or null if unknown. */
   conversation(id: string): Promise<ConversationMessage[] | null>;
+  /** The account's usage limits as last reported; refresh asks the engine again when it is up. */
+  limits?(refresh: boolean): Promise<Limits | null>;
   stop(): Promise<void>;
 }

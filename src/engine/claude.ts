@@ -17,10 +17,11 @@
  *   uuids it answers: that is how a step is told to be the turn's (or a steer's) rather than one
  *   Claude Code runs on its own between turns. A steer is taken in when a step carries its uuid.
  */
+import type { LimitWindow, Limits } from "../api/limits.js";
 import { randomUUID } from "node:crypto";
 import { promises as fs } from "node:fs";
 import type { ChildProcess } from "node:child_process";
-import { getSessionMessages, query, type HookCallback, type McpServerConfig, type Options, type Query, type SDKMessage, type SDKUserMessage } from "@anthropic-ai/claude-agent-sdk";
+import { getSessionMessages, query, type HookCallback, type McpServerConfig, type Options, type Query, type SDKMessage, type SDKRateLimitInfo, type SDKUserMessage } from "@anthropic-ai/claude-agent-sdk";
 import type { InputMessage } from "../api/input.js";
 import type { McpAttachment } from "../mcp/translate.js";
 import { applyPatchCall, customToolCall, shellCall, toolOutput, webSearchCall, type ToolCallItem } from "../api/items.js";
@@ -276,6 +277,7 @@ export class ClaudeEngine implements Engine {
   }
 
   private route(msg: SDKMessage, proc: Proc): void {
+    if (msg.type === "rate_limit_event") return this.limitSeen(msg.rate_limit_info);
     if (msg.type === "system") {
       if (msg.subtype === "init") {
         proc.session = msg.session_id;
@@ -439,6 +441,21 @@ export class ClaudeEngine implements Engine {
     proc.abort.abort();
     if (proc.child) killGroup(proc.child);
     if (this.proc === proc) this.proc = null;
+  }
+
+  private lastLimits: Limits | null = null;
+
+  /** Each rate_limit_event is about one window (five_hour, seven_day, …): it replaces that window. */
+  private limitSeen(info: SDKRateLimitInfo): void {
+    const name = info.rateLimitType ?? "plan";
+    const prev = this.lastLimits?.windows ?? [];
+    const w: LimitWindow = { name, used_percent: info.utilization != null ? Math.round(info.utilization * (info.utilization <= 1 ? 100 : 1)) : null, resets_at: info.resetsAt ?? null };
+    const windows = [...prev.filter((x) => x.name !== name), w];
+    this.lastLimits = { engine: "claude", plan: null, blocked: info.status === "rejected", windows, reset_credits: null, observed_at: Math.floor(Date.now() / 1000) };
+  }
+
+  async limits(): Promise<Limits | null> {
+    return this.lastLimits;
   }
 
   state(): EngineState {

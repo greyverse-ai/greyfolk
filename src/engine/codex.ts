@@ -16,6 +16,11 @@
  *   is the agent's own approval policy. Codex's own approval prompts (commands, file changes)
  *   have no standard shape and nobody to ask, so they are declined.
  */
+import type { LimitWindow, Limits } from "../api/limits.js";
+import type { GetAccountRateLimitsResponse } from "./codex-protocol/v2/GetAccountRateLimitsResponse.js";
+import type { RateLimitResetCreditsSummary } from "./codex-protocol/v2/RateLimitResetCreditsSummary.js";
+import type { RateLimitSnapshot } from "./codex-protocol/v2/RateLimitSnapshot.js";
+import type { RateLimitWindow } from "./codex-protocol/v2/RateLimitWindow.js";
 import { randomUUID } from "node:crypto";
 import { promises as fs } from "node:fs";
 import type { InputMessage } from "../api/input.js";
@@ -103,6 +108,7 @@ export class CodexEngine implements Engine {
   readonly canAskApproval = true;
   readonly canSteer = true;
   private rpc: AppServerRpc | null = null;
+  private lastLimits: Limits | null = null;
   private loaded: Loaded | null = null;
   private active: Active | null = null;
   private model: string | null = null;
@@ -209,6 +215,10 @@ export class CodexEngine implements Engine {
 
   private notification(method: string, params: unknown): void {
     const p = params as { threadId?: string };
+    if (method === "account/rateLimits/updated") {
+      this.limitsSeen((params as { rateLimits: RateLimitSnapshot }).rateLimits, undefined);
+      return;
+    }
     if (method === "thread/status/changed") {
       const { threadId, status } = params as Notification<"thread/status/changed">;
       if (threadId !== this.loaded?.id) {
@@ -400,6 +410,35 @@ export class CodexEngine implements Engine {
     // The process answers with turn/completed (interrupted); if it does not, it is stopped.
     await Promise.race([a.done, new Promise((r) => setTimeout(r, 5000).unref())]);
     if (this.active === a && this.rpc === rpc) killGroup(rpc.child);
+  }
+
+  /** Rolling updates are sparse: what they carry replaces what was known (account/rateLimits/updated). */
+  private limitsSeen(snap: RateLimitSnapshot, credits: RateLimitResetCreditsSummary | null | undefined): void {
+    const prev = this.lastLimits;
+    const windows: LimitWindow[] = [];
+    const win = (name: string, w: RateLimitWindow | null) => {
+      if (w) windows.push({ name: w.windowDurationMins === 10080 ? "weekly" : w.windowDurationMins === 300 ? "five_hour" : name, used_percent: w.usedPercent, resets_at: w.resetsAt, window_minutes: w.windowDurationMins });
+    };
+    win("primary", snap.primary);
+    win("secondary", snap.secondary);
+    this.lastLimits = {
+      engine: "codex",
+      plan: snap.planType ?? prev?.plan ?? null,
+      blocked: snap.rateLimitReachedType != null || windows.some((w) => (w.used_percent ?? 0) >= 100),
+      windows: windows.length ? windows : prev?.windows ?? [],
+      reset_credits: credits === undefined ? prev?.reset_credits ?? null
+        : credits ? { count: Number(credits.availableCount), expires_at: (credits.credits ?? []).filter((c) => c.status === "available").map((c) => c.expiresAt) } : null,
+      observed_at: Math.floor(Date.now() / 1000),
+    };
+  }
+
+  /** Asks the account only through an app-server already running for this agent: starting one just to ask could renew its login. */
+  async limits(refresh: boolean): Promise<Limits | null> {
+    if (refresh && this.rpc) {
+      const r = await this.rpc.call<GetAccountRateLimitsResponse>("account/rateLimits/read", {}).catch(() => null);
+      if (r) this.limitsSeen(r.rateLimits, r.rateLimitResetCredits);
+    }
+    return this.lastLimits;
   }
 
   state(): EngineState {
