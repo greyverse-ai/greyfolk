@@ -1,7 +1,8 @@
 /**
- * A scripted engine for tests and dry runs. No model, no SDK. Echoes each input message word by
+ * The sample engine: how an engine is written (an example, not shipped — `engine/index.ts` does not
+ * list it, so it registers only where it is imported, as in the tests). No model, no SDK. Echoes each input message word by
  * word ("echo: <text>") so steer and cancel can land between steps. Markers in the text:
- *   [tool]    one MCP call (server "fake") and its result
+ *   [tool]    one MCP call (server "sample") and its result
  *   [approve] asks approval before an MCP call to server "ext", then reports the answer
  *   [fail]    ends the turn failed
  *   [spawn]   a native subagent that runs `subagentDelayMs` past the turn (the agent stays busy)
@@ -12,7 +13,7 @@ import { usage, type Turn, type TurnEnd } from "../service/turn.js";
 import type { ConversationMessage, Engine, EngineState, EngineTurn } from "./engine.js";
 import { registerEngine } from "./registry.js";
 
-export interface FakeEngineOptions {
+export interface SampleEngineOptions {
   midTurnInput?: boolean;
   wordDelayMs?: number;
   subagentDelayMs?: number;
@@ -20,14 +21,14 @@ export interface FakeEngineOptions {
 
 const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
 
-export class FakeEngine implements Engine {
-  readonly name = "fake";
-  readonly modelFamily = /^fake-/;
+export class SampleEngine implements Engine {
+  readonly name = "sample";
+  readonly modelFamily = /^sample-/;
   readonly canAskApproval = true;
   get canSteer(): boolean {
     return this.midTurnInput;
   }
-  /** Conversations (the fake's own sessions). */
+  /** Conversations (the sample's own sessions). */
   readonly sessions = new Map<string, ConversationMessage[]>();
   readonly turns: EngineTurn[] = [];
   private current: string | null = null;
@@ -39,7 +40,7 @@ export class FakeEngine implements Engine {
   private readonly delay: number;
   private readonly subagentDelay: number;
 
-  constructor(opts: FakeEngineOptions = {}) {
+  constructor(opts: SampleEngineOptions = {}) {
     this.midTurnInput = opts.midTurnInput ?? true;
     this.delay = opts.wordDelayMs ?? 5;
     this.subagentDelay = opts.subagentDelayMs ?? 30;
@@ -53,7 +54,7 @@ export class FakeEngine implements Engine {
     this.cancelled = false;
     this.turns.push(req);
     try {
-      const id = req.conversation ?? `conv_fake_${randomBytes(6).toString("hex")}`;
+      const id = req.conversation ?? `conv_sample_${randomBytes(6).toString("hex")}`;
       if (!this.sessions.has(id)) this.sessions.set(id, []);
       this.current = id;
       turn.conversationStarted(id);
@@ -83,7 +84,7 @@ export class FakeEngine implements Engine {
         if (steered) continue;
         if (item.content.includes("[tool]")) {
           const call = `call_${randomBytes(4).toString("hex")}`;
-          turn.mcpCallStarted(call, { server: "fake", name: "fake_tool", arguments: { text: item.content } });
+          turn.mcpCallStarted(call, { server: "sample", name: "sample_tool", arguments: { text: item.content } });
           await sleep(this.delay);
           turn.mcpCallEnded(call, "ok", null);
         }
@@ -120,7 +121,7 @@ export class FakeEngine implements Engine {
   }
 
   state(): EngineState {
-    return { running: this.running, conversation: this.current, model: "fake-1", subagents: this.subagents };
+    return { running: this.running, conversation: this.current, model: "sample-1", subagents: this.subagents };
   }
 
   async conversation(id: string): Promise<ConversationMessage[] | null> {
@@ -132,4 +133,4 @@ export class FakeEngine implements Engine {
   }
 }
 
-registerEngine({ name: "fake", create: () => new FakeEngine() });
+registerEngine({ name: "sample", create: () => new SampleEngine() });

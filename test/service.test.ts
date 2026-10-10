@@ -12,7 +12,7 @@ describe("service: the Responses API over one engine", () => {
     expect(events[0]!.type).toBe("response.created");
     expect(events.at(-1)!.type).toBe("response.completed");
     expect(textOf(last)).toBe("echo: hello world");
-    expect(last.conversation?.id).toMatch(/^conv_fake_/);
+    expect(last.conversation?.id).toMatch(/^conv_sample_/);
     expect(events.every((e) => !e.type.startsWith("greyfolk."))).toBe(true);
     expect(agent.state().busy).toBe(false);
   });
@@ -128,8 +128,8 @@ describe("service: the Responses API over one engine", () => {
   it("--model request accepts only the engine's family", async () => {
     const { agent } = await tmpAgent({ modelPolicy: "request" });
     await expect(agent.create(req("hi", { model: "claude-x" }))).rejects.toMatchObject({ code: "model_not_in_family" });
-    const ok = await agent.create(req("hi", { model: "fake-1" }));
-    expect(ok.model).toBe("fake-1");
+    const ok = await agent.create(req("hi", { model: "sample-1" }));
+    expect(ok.model).toBe("sample-1");
     await collectChain(agent, ok.id);
   });
 });

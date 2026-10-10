@@ -3,7 +3,7 @@ import { resolveOptions, type KeyReaders } from "../src/cli-options.js";
 import { CORE_OPTIONS, formatHelp, parseArgv, splitEngineArgs, withDefaults, type OptionSpec } from "../src/options.js";
 
 const keys: KeyReaders = { readKeyFromFd: () => "k-from-fd" };
-const engines = ["fake", "claude", "codex"];
+const engines = ["sample", "claude", "codex"];
 const specs: OptionSpec[] = [...CORE_OPTIONS, { name: "codex-bin", kind: "string", help: "codex engine: the binary" }];
 const base = ["--listen", "tcp:127.0.0.1:0", "--key-fd", "3", "--agent-dir", "/tmp/agent-x"];
 const resolve = (argv: string[]) => {
@@ -31,8 +31,8 @@ describe("start options", () => {
   });
 
   it("never takes the bearer key from argv", () => {
-    expect(() => resolve(["--listen", "tcp:127.0.0.1:0", "--engine", "fake", "--dev-key", "x"])).toThrow(/unknown option --dev-key/);
-    expect(() => resolve(["--listen", "tcp:127.0.0.1:0", "--engine", "fake"])).toThrow(/--key-fd/);
-    expect(resolve([...base, "--engine", "fake"]).key).toBe("k-from-fd");
+    expect(() => resolve(["--listen", "tcp:127.0.0.1:0", "--engine", "sample", "--dev-key", "x"])).toThrow(/unknown option --dev-key/);
+    expect(() => resolve(["--listen", "tcp:127.0.0.1:0", "--engine", "sample"])).toThrow(/--key-fd/);
+    expect(resolve([...base, "--engine", "sample"]).key).toBe("k-from-fd");
   });
 });

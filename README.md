@@ -4,14 +4,14 @@ One agent's engine SDK behind the OpenAI Responses protocol — nothing more. Se
 tools, native subagents, permissions and late results stay the engine's own (its SDK's); greyfolk
 maps them onto the protocol and rebuilds none of them.
 
-Engines: the Claude Agent SDK (`claude`), Codex's own long-running interface `codex app-server` (`codex`), and a scripted
-`fake` for tests. Each agent keeps one engine process across its turns; steer and cancel are calls into it.
+Engines: the Claude Agent SDK (`claude`) and Codex's own long-running interface `codex app-server` (`codex`).
+`src/engine/sample.ts` shows how an engine is written (scripted, no model); it is not shipped, only the tests load it. Each agent keeps one engine process across its turns; steer and cancel are calls into it.
 
 ## Start
 
 ```
 greyfolk --listen unix:/run/agent.sock|tcp:127.0.0.1:8900|fd:3 --key-fd 4 --agent-dir /agents/alice \
-         --engine claude|codex|fake [--model fixed|request] [--soul FILE] [--engine-exec "<launcher>"] \
+         --engine claude|codex [--model fixed|request] [--soul FILE] [--engine-exec "<launcher>"] \
          [-- <the engine's own options, passed to its SDK as they are>]
 ```
 
@@ -53,5 +53,5 @@ greyfolk --listen unix:/run/agent.sock|tcp:127.0.0.1:8900|fd:3 --key-fd 4 --agen
 ```
 npm install && npm run typecheck && npm run build && npm test
 (umask 077; echo dev-key > /tmp/greyfolk.key)
-node dist/cli.js --listen tcp:127.0.0.1:8900 --key-fd 3 --agent-dir ./agent --engine fake 3</tmp/greyfolk.key
+node dist/cli.js --listen tcp:127.0.0.1:8900 --key-fd 3 --agent-dir ./agent --engine claude 3</tmp/greyfolk.key
 ```

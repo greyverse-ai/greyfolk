@@ -1,10 +1,10 @@
 import { AgentService, type ModelPolicy } from "../src/service/agent.js";
-import { FakeEngine } from "../src/engine/fake.js";
+import { SampleEngine } from "../src/engine/sample.js";
 import type { AgentResponse, StreamEvent } from "../src/api/types.js";
 import { TERMINAL_EVENTS } from "../src/api/types.js";
 
 export async function tmpAgent(opts: { midTurnInput?: boolean; wordDelayMs?: number; modelPolicy?: ModelPolicy } = {}) {
-  const engine = new FakeEngine({ midTurnInput: opts.midTurnInput, wordDelayMs: opts.wordDelayMs ?? 5 });
+  const engine = new SampleEngine({ midTurnInput: opts.midTurnInput, wordDelayMs: opts.wordDelayMs ?? 5 });
   const agent = new AgentService({ engine, modelPolicy: opts.modelPolicy ?? "fixed" });
   await agent.init();
   return { agent, engine };

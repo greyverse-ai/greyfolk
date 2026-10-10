@@ -7,29 +7,17 @@ import * as path from "node:path";
 import { promises as fs } from "node:fs";
 import { AgentService } from "./service/agent.js";
 import { BearerAuth, readKeyFromFd } from "./server/auth.js";
-import { parseSoul } from "./soul.js";
 import { startServer } from "./server/index.js";
 import { resolveOptions } from "./cli-options.js";
 import { CORE_OPTIONS, formatHelp, parseArgv, splitEngineArgs, withDefaults } from "./options.js";
 import { engineNames, getEngine } from "./engine/registry.js";
 import "./engine/index.js";
 
-/**
- * `--soul FILE`: instructions added to the engine's own (the engine reads the folder's AGENTS.md /
- * CLAUDE.md itself). Its metadata header is parsed and validated; only the Markdown body is added.
- */
+/** `--soul FILE`: a file added, as it is, to the engine's own instructions (the engine reads the folder's AGENTS.md / CLAUDE.md itself). */
 async function readExtraInstructions(agentDir: string, file: string | undefined): Promise<{ text: string | null; summary: string }> {
   if (!file) return { text: null, summary: "the engine's own" };
   const f = path.resolve(agentDir, file);
-  const text = await fs.readFile(f, "utf8");
-  let soul;
-  try {
-    soul = parseSoul(text);
-  } catch (e) {
-    throw new Error(`soul ${f}: ${(e as Error).message}`);
-  }
-  const m = soul.metadata;
-  return { text: soul.body, summary: `${f} added (${soul.hasHeader ? `name=${m.name ?? "-"} version=${m.version ?? "-"}` : "no metadata header"})` };
+  return { text: await fs.readFile(f, "utf8"), summary: `${f} added` };
 }
 
 async function main(): Promise<void> {

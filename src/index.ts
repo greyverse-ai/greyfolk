@@ -6,7 +6,6 @@ export { Turn, usage, type TurnEnd } from "./service/turn.js";
 export { applyPatchCall, customToolCall, shellCall, toolOutput, webSearchCall, type ToolCallItem } from "./api/items.js";
 export type { Engine, EngineOptions, EngineState, EngineTurn, ConversationMessage } from "./engine/engine.js";
 export { registerEngine, getEngine, engineNames, type EngineDefinition } from "./engine/registry.js";
-export { FakeEngine, type FakeEngineOptions } from "./engine/fake.js";
 export { translateMcpTools } from "./mcp/translate.js";
 export { BearerAuth, readKeyFromFd } from "./server/auth.js";
 export { parseListen, type ListenTarget } from "./server/listen.js";

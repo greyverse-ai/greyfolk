@@ -32,7 +32,7 @@ class ShoutEngine implements Engine {
 
 describe("engine registry", () => {
   it("a new engine is one strategy plus one registration and runs through the unchanged service", async () => {
-    expect(engineNames()).toEqual(expect.arrayContaining(["fake", "claude", "codex"]));
+    expect(engineNames()).toEqual(expect.arrayContaining(["claude", "codex"]));
     registerEngine({ name: "shout", create: () => new ShoutEngine() });
     const agent = new AgentService({ engine: getEngine("shout").create({ agentDir: "/", extraInstructions: null, engineArgs: [], exec: [], values: new Map() }), modelPolicy: "fixed" });
     const r = await agent.create(req("hello there"));
