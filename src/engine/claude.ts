@@ -376,22 +376,44 @@ export class ClaudeEngine implements Engine {
   async run(turn: Turn, req: EngineTurn): Promise<TurnEnd> {
     if (this.active) throw new Error("claude engine: a turn is already running");
     if (turn.cancelRequested) return { status: "cancelled", error: null, usage: null };
-    const proc = this.procFor(req.conversation);
     const uuid = randomUUID();
-    let active!: Active;
-    const ended = new Promise<TurnEnd>((resolve) => {
-      active = { turn, proc, uuids: new Set([uuid]), mine: false, mcp: new Map(req.mcp.map((m) => [m.label, m])), steers: new Map(), end: resolve, cancelled: false, error: null, calls: new Map() };
-    });
-    this.active = active;
-    if (proc.session) turn.conversationStarted(proc.session);
-    try {
+    // Prepare on the session to resume; if it is gone (the folder was moved or its owner changed),
+    // start the conversation fresh rather than failing the turn.
+    const prepare = async (conversation: string | null): Promise<{ proc: Proc; active: Active; ended: Promise<TurnEnd> }> => {
+      const proc = this.procFor(conversation);
+      let active!: Active;
+      const ended = new Promise<TurnEnd>((resolve) => {
+        active = { turn, proc, uuids: new Set([uuid]), mine: false, mcp: new Map(req.mcp.map((m) => [m.label, m])), steers: new Map(), end: resolve, cancelled: false, error: null, calls: new Map() };
+      });
+      this.active = active;
+      if (proc.session) turn.conversationStarted(proc.session);
       await proc.query.setMcpServers(toMcpServers(req.mcp));
       if (req.model || this.requestedModel) await proc.query.setModel(req.model ?? undefined);
       this.requestedModel = req.model;
+      return { proc, active, ended };
+    };
+    const missing = (err: unknown) => /no conversation found|session id/i.test(err instanceof Error ? err.message : String(err));
+    let prepared;
+    try {
+      prepared = await prepare(req.conversation);
     } catch (err) {
-      this.finish(active, { status: "failed", error: `could not prepare the turn: ${err instanceof Error ? err.message : String(err)}`, usage: null });
-      return ended;
+      if (req.conversation !== null && missing(err)) {
+        if (this.proc) this.kill(this.proc);
+        this.active = null;
+        try {
+          prepared = await prepare(null);
+        } catch (err2) {
+          const active = this.active;
+          if (active) this.finish(active, { status: "failed", error: `could not prepare the turn: ${err2 instanceof Error ? err2.message : String(err2)}`, usage: null });
+          return { status: "failed", error: `could not prepare the turn: ${err2 instanceof Error ? err2.message : String(err2)}`, usage: null };
+        }
+      } else {
+        const active = this.active;
+        if (active) this.finish(active, { status: "failed", error: `could not prepare the turn: ${err instanceof Error ? err.message : String(err)}`, usage: null });
+        return { status: "failed", error: `could not prepare the turn: ${err instanceof Error ? err.message : String(err)}`, usage: null };
+      }
     }
+    const { proc, active, ended } = prepared;
     if (turn.cancelRequested || active.cancelled) {
       this.finish(active, { status: "cancelled", error: null, usage: null });
       return ended;
