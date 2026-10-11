@@ -1,11 +1,42 @@
 # greyfolk
 
-One agent's engine SDK behind the OpenAI Responses protocol — nothing more. Sessions, compaction,
-tools, native subagents, permissions and late results stay the engine's own (its SDK's); greyfolk
-maps them onto the protocol and rebuilds none of them.
+**One agent's engine, served as a plain OpenAI Responses endpoint — and nothing more.**
 
-Engines: the Claude Agent SDK (`claude`) and Codex's own long-running interface `codex app-server` (`codex`).
-`src/engine/sample.ts` shows how an engine is written (scripted, no model); it is not shipped, only the tests load it. Each agent keeps one engine process across its turns; steer and cancel are calls into it.
+greyfolk is a thin server that puts a single coding-agent engine (Claude Code, Codex) behind the
+OpenAI *Responses* protocol. One greyfolk process runs one agent. Everything that makes the engine
+an agent — its session, compaction, tools, native subagents, permissions, late/streamed results —
+stays the engine's own; greyfolk only maps those onto the protocol and **rebuilds none of them**.
+
+So a caller talks to any engine the same way — `POST /v1/responses`, stream, steer, cancel — without
+binding to a vendor's SDK or client, and without greyfolk growing a second agent framework of its own.
+
+```
+client ──OpenAI Responses──▶ greyfolk ──SDK/stdio──▶ engine (Claude Code · Codex)
+                              (one per agent)
+```
+
+## What it is, and is not
+
+- **Is:** a protocol adapter. It owns the socket, the bearer-key handshake, the request/response and
+  WebSocket shapes, the health check, and the translation of engine events into standard items.
+- **Is not:** an orchestrator, a sandbox, a permission system, a memory/RAG layer, or a model router.
+  Those belong to the engine (its own features) or to whatever runs greyfolk. If a feature already
+  exists in the engine, greyfolk surfaces it; it does not reimplement it.
+
+In greyverse, the runtime starts one greyfolk per agent, points it at the agent's folder, and reaches
+it over a private socket; the engine's host tools are turned off and sandboxed separately by the
+runtime. greyfolk itself is engine-neutral and runs fine on its own.
+
+## Engines
+
+| engine | backed by | notes |
+|---|---|---|
+| `claude` | the Claude Agent SDK | one Claude Code process per conversation, kept across turns (streaming input), so the session, compaction, native subagents and their late results stay Claude Code's own |
+| `codex` | `codex app-server` (Codex's long-running interface) | one app-server thread per conversation; MCP, approvals and tools are Codex's |
+
+`src/engine/sample.ts` shows how an engine is written (scripted, no model); it is not shipped — only
+the tests load it. Each agent keeps one engine process across its turns; **steer** and **cancel** are
+calls into that live process.
 
 ## Start
 
@@ -47,6 +78,16 @@ greyfolk --listen unix:/run/agent.sock|tcp:127.0.0.1:8900|fd:3 --key-fd 4 --agen
 - **Approval**: a tool needing approval ends the response with an `mcp_approval_request` item; the next request carries an `mcp_approval_response` (with `previous_response_id`) and the turn goes on in its response. With Codex, whether it may ask at all is the agent's own approval policy (its `config.toml`); Codex's own approval prompts for commands and file changes have no standard shape and are declined.
 - **Output items**: MCP tools → `mcp_call`; the engine's own tools → the standard item that means the same (`shell_call`/`shell_call_output`, `apply_patch_call`/`_output`, `web_search_call`, anything else — e.g. the subagent tool — `custom_tool_call`/`_output`).
 
+## Security
+
+- The bearer key arrives once on an inherited file descriptor (`--key-fd`) and is closed — never in
+  argv, the environment or a file. Every request must carry it.
+- A turn's MCP servers carry their own credentials for that turn only; `headers` are **never echoed**
+  back and **never stored**.
+- A `unix:` socket defaults to `0600`; a `tcp:` listener is for a trusted local boundary.
+- greyfolk keeps no secrets of its own and logs none. The engine's host access (shell, files) is not
+  greyfolk's to grant — it is left to the engine's options and to whatever sandboxes the process.
+
 ## Development
 
 ```
@@ -54,3 +95,5 @@ npm install && npm run typecheck && npm run build && npm test
 (umask 077; echo dev-key > /tmp/greyfolk.key)
 node dist/cli.js --listen tcp:127.0.0.1:8900 --key-fd 3 --agent-dir ./agent --engine claude 3</tmp/greyfolk.key
 ```
+
+MIT.
