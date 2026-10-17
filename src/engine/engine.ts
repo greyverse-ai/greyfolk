@@ -27,6 +27,8 @@ export interface EngineTurn {
   instructions: string | null;
   /** Model within the engine's family, or null for the agent's setting. */
   model: string | null;
+  /** Reasoning effort (the engine's own levels), or null for its default. */
+  effort: string | null;
   mcp: McpAttachment[];
 }
 

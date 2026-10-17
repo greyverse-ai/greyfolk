@@ -194,7 +194,7 @@ export class CodexEngine implements Engine {
       return ended;
     }
     try {
-      const r = await rpc.call<TurnStartResponse>("turn/start", { threadId: thread, input: [{ type: "text", text: foldInput(req.input, req.instructions), text_elements: [] }], ...(req.model ? { model: req.model } : {}) });
+      const r = await rpc.call<TurnStartResponse>("turn/start", { threadId: thread, input: [{ type: "text", text: foldInput(req.input, req.instructions), text_elements: [] }], ...(req.model ? { model: req.model } : {}), ...(req.effort ? { effort: req.effort } : {}) });
       active.turnId ??= r.turn.id;
       if (active.cancelled) void this.interrupt(active);
     } catch (err) {

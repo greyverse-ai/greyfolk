@@ -74,7 +74,7 @@ export class AgentService implements ResponsesApi {
     this.turn = next;
     next.open();
     const snapshot = next.current.snapshot();
-    this.finished = this.run(next, { conversation, input: req.input, instructions: req.instructions, model: this.opts.modelPolicy === "request" ? req.model : null, mcp });
+    this.finished = this.run(next, { conversation, input: req.input, instructions: req.instructions, model: this.opts.modelPolicy === "request" ? req.model : null, effort: req.effort, mcp });
     return snapshot;
   }
 

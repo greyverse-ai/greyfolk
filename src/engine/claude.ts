@@ -160,6 +160,7 @@ export class ClaudeEngine implements Engine {
   private readonly queryFn: typeof query;
   private readonly extraArgs: Record<string, string | null>;
   private model: string | null = null;
+  private requestedEffort: string | null = null;
   private proc: Proc | null = null;
   private active: Active | null = null;
   private requestedModel: string | null = null;
@@ -390,6 +391,10 @@ export class ClaudeEngine implements Engine {
       await proc.query.setMcpServers(toMcpServers(req.mcp));
       if (req.model || this.requestedModel) await proc.query.setModel(req.model ?? undefined);
       this.requestedModel = req.model;
+      if (req.effort || this.requestedEffort) { // each turn: a process started again starts at its default
+        await proc.query.applyFlagSettings({ effortLevel: (req.effort ?? undefined) as never });
+        this.requestedEffort = req.effort;
+      }
       return { proc, active, ended };
     };
     const missing = (err: unknown) => /no conversation found|session id/i.test(err instanceof Error ? err.message : String(err));

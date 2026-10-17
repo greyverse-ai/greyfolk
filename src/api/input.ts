@@ -16,6 +16,8 @@ export type InputMessage = EasyInputMessage & { role: "user" | "system" | "devel
 /** A create request after validation. */
 export interface ParsedRequest {
   model: string | null;
+  /** `reasoning.effort`: how hard the engine thinks (the engine's own levels), or null for its default. */
+  effort: string | null;
   /** The new input items, in order (assistant items are never among them). */
   input: InputMessage[];
   /** `mcp_approval_response` items: answers to approval requests the previous response ended with. */
@@ -40,6 +42,8 @@ export function parseCreateRequest(body: CreateParams | unknown): ParsedRequest 
   if (b.input === undefined) throw ApiError.invalid("Missing required parameter: 'input'.", "missing_required_parameter", "input");
 
   const model = b.model === undefined || b.model === null ? null : String(b.model);
+  const reasoning = asRecord(b.reasoning);
+  const effort = reasoning && typeof reasoning.effort === "string" && reasoning.effort ? reasoning.effort : null;
   const instructions = b.instructions === undefined || b.instructions === null ? null : String(b.instructions);
   const previous = b.previous_response_id === undefined || b.previous_response_id === null ? null : String(b.previous_response_id);
 
@@ -69,6 +73,7 @@ export function parseCreateRequest(body: CreateParams | unknown): ParsedRequest 
 
   return {
     model,
+    effort,
     input: selectNewItems(normaliseInput(items ? rest : b.input), previous !== null || conversation !== null),
     approvals,
     conversation,
