@@ -395,7 +395,15 @@ export class ClaudeEngine implements Engine {
       if (!this.knownModels && typeof proc.query.supportedModels === "function") {
         // The account's models, asked of the process already up (it waits for its start).
         void proc.query.supportedModels().then((ms) => {
-          this.knownModels = ms.map((m) => ({ id: m.resolvedModel ?? m.value, name: m.displayName, efforts: m.supportsEffort ? [...(m.supportedEffortLevels ?? [])] : [] }));
+          // The "default" row is an alias of one of the others: that one is marked default instead.
+          const def = ms.find((m) => m.value === "default")?.resolvedModel;
+          const out: EngineModel[] = [];
+          for (const m of ms) {
+            const id = m.resolvedModel ?? m.value;
+            if (m.value === "default" || out.some((x) => x.id === id)) continue;
+            out.push({ id, name: m.displayName, efforts: m.supportsEffort ? [...(m.supportedEffortLevels ?? [])] : [], default: id === def });
+          }
+          this.knownModels = out;
         }).catch(() => undefined);
       }
       if (req.effort || this.requestedEffort) { // each turn: a process started again starts at its default
