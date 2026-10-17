@@ -8,7 +8,7 @@ import type { AgentResponse, AgentState, ConversationItemList, CreateParams, Mcp
 import { ApiError } from "../api/errors.js";
 import { normaliseInput, parseCreateRequest, type InputMessage } from "../api/input.js";
 import { translateMcpTools } from "../mcp/translate.js";
-import type { Engine } from "../engine/engine.js";
+import type { Engine, EngineModel } from "../engine/engine.js";
 import { newId, ResponseLog, type ResponseRecord } from "./response-log.js";
 import { Turn, type TurnEnd } from "./turn.js";
 
@@ -165,6 +165,10 @@ export class AgentService implements ResponsesApi {
       content: [m.role === "user" ? { type: "input_text" as const, text: m.text } : { type: "output_text" as const, text: m.text, annotations: [] }],
     }));
     return { object: "list", data, first_id: data[0]?.id ?? "", last_id: data.at(-1)?.id ?? "", has_more: false } as unknown as ConversationItemList;
+  }
+
+  async models(): Promise<EngineModel[] | null> {
+    return this.engine.models ? this.engine.models() : null;
   }
 
   /** The engine account's limits as last reported; asked again (briefly) when that is over a minute old. */

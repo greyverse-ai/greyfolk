@@ -26,7 +26,7 @@ import type { InputMessage } from "../api/input.js";
 import type { McpAttachment } from "../mcp/translate.js";
 import { applyPatchCall, customToolCall, shellCall, toolOutput, webSearchCall, type ToolCallItem } from "../api/items.js";
 import { usage, type Turn, type TurnEnd } from "../service/turn.js";
-import type { ConversationMessage, Engine, EngineOptions, EngineState, EngineTurn } from "./engine.js";
+import type { ConversationMessage, Engine, EngineModel, EngineOptions, EngineState, EngineTurn } from "./engine.js";
 import { checkExecPrefix, killGroup, spawnGroup } from "./process.js";
 import { foldInput, textOf } from "./prompt.js";
 import { registerEngine } from "./registry.js";
@@ -161,6 +161,7 @@ export class ClaudeEngine implements Engine {
   private readonly extraArgs: Record<string, string | null>;
   private model: string | null = null;
   private requestedEffort: string | null = null;
+  private knownModels: EngineModel[] | null = null;
   private proc: Proc | null = null;
   private active: Active | null = null;
   private requestedModel: string | null = null;
@@ -391,6 +392,12 @@ export class ClaudeEngine implements Engine {
       await proc.query.setMcpServers(toMcpServers(req.mcp));
       if (req.model || this.requestedModel) await proc.query.setModel(req.model ?? undefined);
       this.requestedModel = req.model;
+      if (!this.knownModels && typeof proc.query.supportedModels === "function") {
+        // The account's models, asked of the process already up (it waits for its start).
+        void proc.query.supportedModels().then((ms) => {
+          this.knownModels = ms.map((m) => ({ id: m.resolvedModel ?? m.value, name: m.displayName, efforts: m.supportsEffort ? [...(m.supportedEffortLevels ?? [])] : [] }));
+        }).catch(() => undefined);
+      }
       if (req.effort || this.requestedEffort) { // each turn: a process started again starts at its default
         await proc.query.applyFlagSettings({ effortLevel: (req.effort ?? undefined) as never });
         this.requestedEffort = req.effort;
@@ -482,6 +489,10 @@ export class ClaudeEngine implements Engine {
 
   async limits(): Promise<Limits | null> {
     return this.lastLimits;
+  }
+
+  async models(): Promise<EngineModel[] | null> {
+    return this.knownModels;
   }
 
   state(): EngineState {

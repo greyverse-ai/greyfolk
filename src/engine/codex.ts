@@ -18,6 +18,7 @@
  */
 import type { LimitWindow, Limits } from "../api/limits.js";
 import type { GetAccountRateLimitsResponse } from "./codex-protocol/v2/GetAccountRateLimitsResponse.js";
+import type { ModelListResponse } from "./codex-protocol/v2/ModelListResponse.js";
 import type { RateLimitResetCreditsSummary } from "./codex-protocol/v2/RateLimitResetCreditsSummary.js";
 import type { RateLimitSnapshot } from "./codex-protocol/v2/RateLimitSnapshot.js";
 import type { RateLimitWindow } from "./codex-protocol/v2/RateLimitWindow.js";
@@ -39,7 +40,7 @@ import type { McpServerElicitationRequestResponse } from "./codex-protocol/v2/Mc
 import type { TokenUsageBreakdown } from "./codex-protocol/v2/TokenUsageBreakdown.js";
 import { codexBinary } from "./codex-binary.js";
 import { AppServerRpc, RpcError } from "./codex-rpc.js";
-import type { ConversationMessage, Engine, EngineOptions, EngineState, EngineTurn } from "./engine.js";
+import type { ConversationMessage, Engine, EngineModel, EngineOptions, EngineState, EngineTurn } from "./engine.js";
 import { checkExecPrefix, killGroup, spawnGroup } from "./process.js";
 import { foldInput } from "./prompt.js";
 import { registerEngine } from "./registry.js";
@@ -427,6 +428,15 @@ export class CodexEngine implements Engine {
       observed_at: Math.floor(Date.now() / 1000),
     };
   }
+
+  /** The account's models, asked of an app-server already running (never started just to ask). */
+  async models(): Promise<EngineModel[] | null> {
+    if (!this.rpc) return this.knownModels;
+    const r = await this.rpc.call<ModelListResponse>("model/list", { includeHidden: false }).catch(() => null);
+    if (r) this.knownModels = r.data.filter((m) => !m.hidden).map((m) => ({ id: m.model, name: m.displayName, efforts: m.supportedReasoningEfforts.map((e) => String(e.reasoningEffort)), default_effort: String(m.defaultReasoningEffort), default: m.isDefault }));
+    return this.knownModels;
+  }
+  private knownModels: EngineModel[] | null = null;
 
   /** Asks the account only through an app-server already running for this agent: starting one just to ask could renew its login. */
   async limits(refresh: boolean): Promise<Limits | null> {

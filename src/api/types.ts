@@ -3,6 +3,7 @@
  * greyfolk adds nothing of its own to it; its state is read through a standard health check.
  */
 import type { Limits } from "./limits.js";
+import type { EngineModel } from "../engine/engine.js";
 import type { Response, ResponseCreateParamsBase, ResponseStreamEvent, ResponseSteerAcceptedEvent, ResponseSteerErrorCode, ResponseSteerInput, Tool } from "openai/resources/responses/responses";
 import type { ConversationItemList } from "openai/resources/conversations/items";
 
@@ -73,5 +74,7 @@ export interface ResponsesApi {
   state(): AgentState;
   /** The engine account's own usage limits, for the health check (null when the engine reports none). */
   limits(): Promise<Limits | null>;
+  /** The engine's models (`GET /v1/models`), or null before the engine has run. */
+  models(): Promise<EngineModel[] | null>;
   close(): Promise<void>;
 }

@@ -40,6 +40,15 @@ export interface EngineState {
   subagents: number;
 }
 
+/** A model the engine offers: its id, its name, its reasoning efforts (none: it takes none). */
+export interface EngineModel {
+  id: string;
+  name: string;
+  efforts: string[];
+  default_effort?: string;
+  default?: boolean;
+}
+
 /** One message of a conversation as the engine's session holds it. */
 export interface ConversationMessage {
   role: "user" | "assistant";
@@ -62,6 +71,9 @@ export interface Engine {
   state(): EngineState;
   /** The conversation as the engine's session holds it, or null if unknown. */
   conversation(id: string): Promise<ConversationMessage[] | null>;
+  /** The models the engine's account offers, as the engine says (each with its reasoning efforts);
+   * known once the engine has run (it is never started just to ask). */
+  models?(): Promise<EngineModel[] | null>;
   /** The account's usage limits as last reported; refresh asks the engine again when it is up. */
   limits?(refresh: boolean): Promise<Limits | null>;
   stop(): Promise<void>;

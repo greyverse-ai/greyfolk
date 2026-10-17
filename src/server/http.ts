@@ -94,6 +94,11 @@ export function createRequestHandler(agent: ResponsesApi, auth: BearerAuth): (re
     const method = req.method ?? "GET";
     const parts = url.pathname.split("/").filter(Boolean);
     if (parts.length === 1 && parts[0] === "health" && method === "GET") return sendJson(res, 200, toHealth(agent.state(), await agent.limits()), HEALTH_CONTENT_TYPE);
+    // The engine's models, OpenAI-shaped (each with its reasoning efforts); empty before it has run.
+    if (parts.length === 2 && parts[0] === "v1" && parts[1] === "models" && method === "GET") {
+      const ms = (await agent.models()) ?? [];
+      return sendJson(res, 200, { object: "list", data: ms.map((m) => ({ id: m.id, object: "model", owned_by: "engine", name: m.name, reasoning_efforts: m.efforts, default_reasoning_effort: m.default_effort ?? null, default: m.default ?? false })) });
+    }
     if (parts[0] === "v1" && parts[1] === "responses") {
       if (parts.length === 2 && method === "POST") {
         const body = (await readJsonBody(req)) as CreateParams;
